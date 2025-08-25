@@ -119,9 +119,9 @@ if [ "$DRYRUN" != "1" ]; then
       --exclude='*.py' --exclude='.*' --exclude='*.gz' --exclude='row_gz' \
       -cf "$OUT/fraud_dataset_full.tar.zst" -C "$PUB" .
 
-  [ -d "$PUB/dataset_v1" ] && tar -I "zstd -19 -T0" \
+  [ -d "$PUB/gnn_dataset" ] && tar -I "zstd -19 -T0" \
       --exclude='*.py' --exclude='.*' --exclude='*.gz' --exclude='row_gz' \
-      -cf "$OUT/fraud_dataset_gnn.tar.zst" -C "$PUB" dataset_v1
+      -cf "$OUT/fraud_dataset_gnn.tar.zst" -C "$PUB" gnn_dataset
 
   [ -d "$PUB/lstm_dataset" ] && tar -I "zstd -19 -T0" \
       --exclude='*.py' --exclude='.*' --exclude='*.gz' --exclude='row_gz' \
