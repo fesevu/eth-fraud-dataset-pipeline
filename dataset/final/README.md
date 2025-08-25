@@ -9,7 +9,16 @@ The dataset is built from:
 - **Etherscan labels + custom scam labels**.
 - **Balanced address list** of ~115k addresses (scam vs non-scam, contracts vs EOAs).
 
-https://github.com/fesevu/eth-fraud-dataset-pipeline
+## 📦 Dataset Collection Pipeline
+
+To reproduce or customize the dataset, use the instructions and code in the [eth-fraud-dataset-pipeline repository](https://github.com/fesevu/eth-fraud-dataset-pipeline).  
+That repository provides:
+- Scripts for downloading raw data from public sources (BigQuery, Etherscan, curated scam lists).
+- Code for merging, deduplicating, and balancing address labels.
+- Tools for building the GNN and LSTM datasets (parquet files, mappings, targets).
+- Utilities for generating checksums and manifests for data integrity.
+
+**You must run the provided scripts to generate the dataset locally; the data files are not stored in the GitHub repository.**
 ---
 
 ## 📂 Repository Structure
