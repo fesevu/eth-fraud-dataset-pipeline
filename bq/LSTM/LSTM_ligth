@@ -1,0 +1,101 @@
+-- (опционально) создать датасет, если его нет
+CREATE SCHEMA IF NOT EXISTS `kinetic-physics-469205-b2.LSTM`;
+
+CREATE OR REPLACE TABLE `kinetic-physics-469205-b2.LSTM.daily_final_light`
+PARTITION BY day
+CLUSTER BY address AS
+SELECT
+  address, day,
+  normal_sent_cnt, normal_recv_cnt, normal_total_cnt, normal_failed_cnt,
+  normal_to_contract_cnt, normal_to_eoa_cnt,
+  eth_sent_sum, eth_recv_sum, eth_net_flow,
+  tx_fee_eth_sum, gas_used_sum,
+  erc20_sent_cnt, erc20_recv_cnt, erc20_total_cnt,
+  erc20_unique_tokens_sent, erc20_unique_tokens_recv,
+  internal_out_cnt, internal_in_cnt,
+  internal_out_value_eth_sum, internal_in_value_eth_sum,
+  uniq_peers_cnt, uniq_contract_peers_cnt, uniq_eoa_peers_cnt,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+FROM `kinetic-physics-469205-b2.addr_daily.daily_final`;
+-- age_days можно восстановить в тренинг‑пайплайне как:
+-- DATE_DIFF(day, MIN(day) OVER (PARTITION BY address), DAY)
+
+CREATE OR REPLACE TABLE `kinetic-physics-469205-b2.LSTM.daily_final_light_pruned`
+PARTITION BY day
+CLUSTER BY address, week AS
+WITH
+params AS (
+  SELECT 4 AS K_KEEP_EVERY   -- меняй 4 на 8/12 если нужно сильнее прореживать
+),
+base AS (
+  SELECT
+    t.*,
+    DATE_TRUNC(day, WEEK(MONDAY)) AS week,
+    (normal_total_cnt + erc20_total_cnt + internal_in_cnt + internal_out_cnt) AS day_activity
+  FROM `kinetic-physics-469205-b2.LSTM.daily_final_light` t
+),
+week_marks AS (
+  SELECT
+    address,
+    week,
+    SUM(day_activity) AS week_activity
+  FROM base
+  GROUP BY address, week
+),
+week_runs AS (
+  SELECT
+    address,
+    week,
+    week_activity,
+    CASE WHEN week_activity > 0 THEN 0 ELSE 1 END AS is_zero,
+    CASE
+      WHEN week_activity = 0
+       AND LAG(CASE WHEN week_activity = 0 THEN 1 ELSE 0 END)
+           OVER (PARTITION BY address ORDER BY week) = 0
+      THEN 1 ELSE 0
+    END AS zero_run_start
+  FROM week_marks
+),
+zero_runs AS (
+  SELECT
+    address,
+    week,
+    week_activity,
+    is_zero,
+    SUM(CASE WHEN is_zero = 1 AND zero_run_start = 1 THEN 1 ELSE 0 END)
+      OVER (PARTITION BY address ORDER BY week
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS zero_run_id
+  FROM week_runs
+),
+zero_runs_ranked AS (
+  SELECT
+    address,
+    week,
+    week_activity,
+    is_zero,
+    zero_run_id,
+    CASE WHEN is_zero = 1 THEN ROW_NUMBER() OVER (PARTITION BY address, zero_run_id ORDER BY week) END AS zero_idx_in_run,
+    CASE WHEN is_zero = 1 THEN COUNT(*)     OVER (PARTITION BY address, zero_run_id) END AS zero_run_len
+  FROM zero_runs
+),
+weeks_to_keep AS (
+  SELECT
+    z.address,
+    z.week,
+    (z.week_activity > 0) AS is_active,
+    CASE WHEN z.is_zero = 1 AND (z.zero_idx_in_run = 1 OR z.zero_idx_in_run = z.zero_run_len) THEN TRUE ELSE FALSE END AS is_boundary_zero,
+    CASE
+      WHEN z.is_zero = 1 AND z.zero_run_len >= 3
+       AND MOD(zero_idx_in_run - 1, (SELECT K_KEEP_EVERY FROM params)) = 0
+      THEN TRUE ELSE FALSE
+    END AS is_sampled_zero
+  FROM zero_runs_ranked z
+),
+kept_weeks AS (
+  SELECT address, week
+  FROM weeks_to_keep
+  WHERE is_active OR is_boundary_zero OR is_sampled_zero
+)
+SELECT b.*
+FROM base b
+JOIN kept_weeks k USING (address, week);

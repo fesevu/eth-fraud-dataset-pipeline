@@ -1,0 +1,37 @@
+-- Для каждой записи из base0_activity добавляем флаг is_contract
+-- Значение:
+--   1 = адрес является смарт-контрактом
+--   0 = адрес — обычный EOA (Externally Owned Account, кошелёк)
+
+-- Базовая таблица: берём все поля из ранее подготовленного датасета base0_activity
+WITH base AS (
+  SELECT
+    address,            -- Ethereum-адрес
+    is_scam,            -- метка (1 = скам, 0 = чистый)
+    description,        -- описание адреса (биржа, декс, скам-метка и т.д.)
+    activity_start_ts,  -- первая активность (Unix timestamp)
+    activity_end_ts     -- последняя активность (Unix timestamp)
+  FROM `kinetic-physics-469205-b2.merged_accounts_base.base0_activity`
+),
+
+-- Таблица со всеми контрактами из публичного датасета BigQuery
+-- (каждая строка = адрес контракта, у него есть bytecode и метаданные)
+contracts AS (
+  SELECT LOWER(address) AS address
+  FROM `bigquery-public-data.crypto_ethereum.contracts`
+)
+
+-- Основной запрос
+SELECT
+  b.address,
+  b.is_scam,
+  b.description,
+  b.activity_start_ts,
+  b.activity_end_ts,
+  -- Если адрес найден в таблице contracts → это контракт (is_contract = 1)
+  -- Если нет → это обычный EOA (is_contract = 0)
+  IF(c.address IS NOT NULL, 1, 0) AS is_contract
+FROM base b
+LEFT JOIN contracts c
+  ON b.address = c.address   -- соединяем по адресу
+ORDER BY b.address;          -- сортируем результат по адресу

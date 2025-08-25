@@ -1,0 +1,232 @@
+-- ============================================
+-- Balancing script (BigQuery) — без сохранения is_exchange
+-- ============================================
+
+-- ---- Параметры
+DECLARE KEEP_RATIO   FLOAT64 DEFAULT 1.10;   -- 1.10 = негативов на 10% больше; 1.0 = поровну
+DECLARE ENSURE_EXCH  INT64   DEFAULT 2000;   -- минимально требуемое число exchanges в не-скаме
+DECLARE SEED         STRING  DEFAULT '42';   -- детерминированность семплинга
+
+-- ---- Имена итоговых таблиц
+DECLARE TGT_BAL  STRING DEFAULT 'kinetic-physics-469205-b2.merged_accounts_base.base0_contracts_balanced_v1';
+DECLARE TGT_DROP STRING DEFAULT 'kinetic-physics-469205-b2.merged_accounts_base.base0_contracts_discarded_v1';
+
+-- ---- Счётчики
+DECLARE POS INT64;
+DECLARE NEG_TOTAL INT64;
+DECLARE NEG_T_CONTRACT INT64;
+DECLARE NEG_T_EOA INT64;
+
+DECLARE CON_EXCH_AVAIL INT64;
+DECLARE EOA_EXCH_AVAIL INT64;
+DECLARE CON_EXCH_TAKE  INT64;
+DECLARE EOA_EXCH_TAKE  INT64;
+
+DECLARE EXCH_SELECTED  INT64;
+DECLARE EXCH_DEFICIT   INT64;
+DECLARE EXTRA_CNT      INT64;
+DECLARE EXTRA_CON      INT64;
+DECLARE EXTRA_EOA      INT64;
+
+-- ============================================
+-- 1) База (+временный флаг is_exchange)
+-- ============================================
+CREATE TEMP TABLE _base AS
+SELECT
+  address,
+  is_scam,
+  description,
+  activity_start_ts,
+  activity_end_ts,
+  is_contract,
+  REGEXP_CONTAINS(LOWER(COALESCE(description,'')),
+    r'(exchange|binance|coinbase|kraken|okx|okex|huobi|htx|bybit|bitfinex|kucoin|gate\.?io|mexc|gemini|poloniex|bittrex|bitstamp|okcoin|upbit|lbank|bitmart|bitget|whitebit|bitso|wazirx|coincheck|liquid|zaif|bithumb|korbit|coinone|bitflyer|bitbank|idex|dydx|uniswap|sushiswap|curve|balancer|1inch|paraswap|matcha|cow\s*swap)'
+  ) AS is_exchange
+FROM `kinetic-physics-469205-b2.merged_accounts_base.base0_contracts`;
+
+-- ============================================
+-- 2) Подсчёты размеров
+-- ============================================
+SET POS = (SELECT COUNT(*) FROM _base WHERE is_scam = 1);
+SET NEG_TOTAL = CAST(ROUND(POS * KEEP_RATIO) AS INT64);
+
+SET NEG_T_CONTRACT = CAST(FLOOR(NEG_TOTAL/2) AS INT64);
+SET NEG_T_EOA      = NEG_TOTAL - NEG_T_CONTRACT;
+
+SET CON_EXCH_AVAIL = (SELECT COUNT(*) FROM _base WHERE is_scam = 0 AND is_contract = 1 AND is_exchange);
+SET EOA_EXCH_AVAIL = (SELECT COUNT(*) FROM _base WHERE is_scam = 0 AND IFNULL(is_contract,0) = 0 AND is_exchange);
+
+SET CON_EXCH_TAKE = LEAST(NEG_T_CONTRACT, CON_EXCH_AVAIL);
+SET EOA_EXCH_TAKE = LEAST(NEG_T_EOA,      EOA_EXCH_AVAIL);
+
+-- ============================================
+-- 3) Позитив (все скамы) — 6 исходных колонок
+-- ============================================
+CREATE TEMP TABLE _scam AS
+SELECT
+  address, is_scam, description, activity_start_ts, activity_end_ts, is_contract
+FROM _base
+WHERE is_scam = 1;
+
+-- ============================================
+-- 4) Негатив: контракты и EOA (exchanges → приоритет)
+-- ============================================
+-- Контракты
+CREATE TEMP TABLE _neg_contract_pick AS
+WITH c AS (
+  SELECT
+    b.*,
+    FARM_FINGERPRINT(CONCAT(SEED, b.address)) AS rnd
+  FROM _base b
+  WHERE b.is_scam = 0 AND b.is_contract = 1
+),
+exch AS (
+  SELECT * FROM c
+  WHERE is_exchange
+  QUALIFY ROW_NUMBER() OVER (ORDER BY rnd) <= CON_EXCH_TAKE
+),
+non_exch AS (
+  SELECT * FROM c
+  WHERE NOT is_exchange
+  QUALIFY ROW_NUMBER() OVER (ORDER BY rnd) <= (NEG_T_CONTRACT - CON_EXCH_TAKE)
+)
+SELECT
+  address, is_scam, description, activity_start_ts, activity_end_ts, is_contract
+FROM exch
+UNION ALL
+SELECT
+  address, is_scam, description, activity_start_ts, activity_end_ts, is_contract
+FROM non_exch
+;
+
+-- EOA
+CREATE TEMP TABLE _neg_eoa_pick AS
+WITH c AS (
+  SELECT
+    b.*,
+    FARM_FINGERPRINT(CONCAT(SEED, b.address)) AS rnd
+  FROM _base b
+  WHERE b.is_scam = 0 AND IFNULL(b.is_contract,0) = 0
+),
+exch AS (
+  SELECT * FROM c
+  WHERE is_exchange
+  QUALIFY ROW_NUMBER() OVER (ORDER BY rnd) <= EOA_EXCH_TAKE
+),
+non_exch AS (
+  SELECT * FROM c
+  WHERE NOT is_exchange
+  QUALIFY ROW_NUMBER() OVER (ORDER BY rnd) <= (NEG_T_EOA - EOA_EXCH_TAKE)
+)
+SELECT
+  address, is_scam, description, activity_start_ts, activity_end_ts, is_contract
+FROM exch
+UNION ALL
+SELECT
+  address, is_scam, description, activity_start_ts, activity_end_ts, is_contract
+FROM non_exch
+;
+
+-- ============================================
+-- 5) Досбор exchanges при дефиците, сохраняя 50/50 по типам
+-- ============================================
+CREATE TEMP TABLE _neg_selected_initial AS
+SELECT * FROM _neg_contract_pick
+UNION ALL
+SELECT * FROM _neg_eoa_pick;
+
+-- сколько exchanges уже в не-скаме
+SET EXCH_SELECTED = (
+  SELECT COUNT(*) FROM _base b
+  JOIN _neg_selected_initial n USING(address)
+  WHERE b.is_exchange
+);
+
+IF EXCH_SELECTED < ENSURE_EXCH THEN
+  SET EXCH_DEFICIT = ENSURE_EXCH - EXCH_SELECTED;
+
+  -- Доп. exchanges (не-скам), которых ещё нет в выборке
+  CREATE TEMP TABLE _extra_exchanges AS
+  WITH cand AS (
+    SELECT
+      b.*,
+      FARM_FINGERPRINT(CONCAT(SEED, b.address)) AS rnd
+    FROM _base b
+    WHERE b.is_scam = 0 AND b.is_exchange
+  ),
+  minus_selected AS (
+    SELECT c.*
+    FROM cand c
+    LEFT JOIN (SELECT address FROM _neg_selected_initial) s USING(address)
+    WHERE s.address IS NULL
+  )
+  SELECT
+    address, is_scam, description, activity_start_ts, activity_end_ts, is_contract
+  FROM minus_selected
+  QUALIFY ROW_NUMBER() OVER (ORDER BY rnd) <= EXCH_DEFICIT
+  ;
+
+  SET EXTRA_CNT = (SELECT COUNT(*) FROM _extra_exchanges);
+  SET EXTRA_CON = (SELECT COUNT(*) FROM _extra_exchanges WHERE is_contract = 1);
+  SET EXTRA_EOA = (SELECT COUNT(*) FROM _extra_exchanges WHERE IFNULL(is_contract,0) = 0);
+
+  -- Снимаем столько же не‑exchange в соответствующих типах, чтобы сохранить 50/50
+  CREATE TEMP TABLE _drops AS
+  WITH cand AS (
+    SELECT
+      n.*,
+      FARM_FINGERPRINT(CONCAT(SEED, n.address)) AS rnd
+    FROM _neg_selected_initial n
+    JOIN _base b USING(address)
+    WHERE NOT b.is_exchange
+  ),
+  drops_con AS (
+    SELECT * FROM cand
+    WHERE is_contract = 1
+    QUALIFY ROW_NUMBER() OVER (ORDER BY rnd) <= EXTRA_CON
+  ),
+  drops_eoa AS (
+    SELECT * FROM cand
+    WHERE IFNULL(is_contract,0) = 0
+    QUALIFY ROW_NUMBER() OVER (ORDER BY rnd) <= EXTRA_EOA
+  )
+  SELECT
+    address, is_scam, description, activity_start_ts, activity_end_ts, is_contract
+  FROM drops_con
+  UNION ALL
+  SELECT
+    address, is_scam, description, activity_start_ts, activity_end_ts, is_contract
+  FROM drops_eoa
+  ;
+
+  CREATE TEMP TABLE _neg_selected AS
+  SELECT * FROM _neg_selected_initial
+  EXCEPT DISTINCT
+  SELECT * FROM _drops
+  UNION DISTINCT
+  SELECT * FROM _extra_exchanges
+  ;
+
+ELSE
+  CREATE TEMP TABLE _neg_selected AS
+  SELECT * FROM _neg_selected_initial;
+END IF;
+
+-- ============================================
+-- 6) Итоговые таблицы: balanced + discarded (только исходные поля)
+-- ============================================
+CREATE OR REPLACE TABLE `kinetic-physics-469205-b2.merged_accounts_base.base0_contracts_balanced_v1`
+CLUSTER BY is_scam, is_contract AS
+SELECT * FROM _scam
+UNION ALL
+SELECT * FROM _neg_selected
+;
+
+CREATE OR REPLACE TABLE `kinetic-physics-469205-b2.merged_accounts_base.base0_contracts_discarded_v1` AS
+SELECT b.address, b.is_scam, b.description, b.activity_start_ts, b.activity_end_ts, b.is_contract
+FROM _base b
+LEFT JOIN (
+  SELECT address FROM `kinetic-physics-469205-b2.merged_accounts_base.base0_contracts_balanced_v1`
+) s USING(address)
+WHERE s.address IS NULL
+;

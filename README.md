@@ -1,0 +1,1 @@
+This repository contains the full pipeline for building and cleaning the Ethereum fraud detection dataset used for a middle-fusion GNN+LSTM model. It includes data sources, preprocessing steps, and final dataset structure.

@@ -1,0 +1,18 @@
+-- Создаём новую таблицу без исключённых адресов
+-- ЛИНЕЙНАЯ сложность: O(N + M), где N — строк в daily_final_light_pruned, M — адресов-исключений.
+-- Никаких DECLARE. Полностью квалифицированные имена таблиц.
+
+CREATE OR REPLACE TABLE `kinetic-physics-469205-b2.LSTM.daily_final_light_pruned_filtered`
+PARTITION BY day                         -- ✅ допустимая партиционизация (колонка DATE)
+CLUSTER BY address, week                 -- ⚙️ ускорит фильтрацию/джоины по адресу и неделе
+AS
+SELECT
+  a.*
+FROM `kinetic-physics-469205-b2.LSTM.daily_final_light_pruned` AS a
+LEFT JOIN (
+  -- Множество исключённых адресов (приводим к нижнему регистру + убираем дубликаты)
+  SELECT DISTINCT LOWER(address) AS address_lc
+  FROM `kinetic-physics-469205-b2.merged_accounts_base.base0_contracts_discarded_v1`
+) AS b
+ON LOWER(a.address) = b.address_lc
+WHERE b.address_lc IS NULL;              -- оставляем только не исключённые адреса

@@ -1,0 +1,375 @@
+-- ==========================================================
+-- S3 (low-shuffle, 16 батчей по 4 шарда)
+-- ==========================================================
+
+-- ---------- S3.A: КЭШ транзакций по нужным дням ----------
+CREATE OR REPLACE TABLE `kinetic-physics-469205-b2.GNN2.S3_tx_by_day`
+PARTITION BY day
+CLUSTER BY from_address, to_address AS
+WITH days AS (
+  SELECT DISTINCT day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+)
+SELECT
+  `hash`                AS tx_hash,
+  LOWER(from_address)   AS from_address,
+  LOWER(to_address)     AS to_address,
+  block_number,
+  block_timestamp       AS ts,
+  DATE(block_timestamp) AS day,
+  value                 AS value_wei_raw,
+  gas_price             AS gas_price_wei,
+  receipt_gas_used      AS gas_used,
+  nonce,
+  input                 AS input_bytes
+FROM `bigquery-public-data.crypto_ethereum.transactions`
+WHERE DATE(block_timestamp) IN (SELECT day FROM days)
+;
+
+-- ---------- S3.A2: ИНДЕКС (day, addr -> tx_hash) ----------
+CREATE OR REPLACE TABLE `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day`
+PARTITION BY day
+CLUSTER BY addr AS
+SELECT DISTINCT
+  day,
+  from_address AS addr,
+  tx_hash
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day`
+UNION ALL
+SELECT DISTINCT
+  day,
+  to_address   AS addr,
+  tx_hash
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day`
+;
+
+-- S3.B: целевая таблица под E2 (пустая, для последующих INSERT)
+CREATE OR REPLACE TABLE `kinetic-physics-469205-b2.GNN2.S3_e2_raw` (
+  from_address   STRING,
+  to_address     STRING,
+  block_number   INT64,
+  timestamp      TIMESTAMP,
+  value_wei_raw  NUMERIC,
+  gas_price_wei  NUMERIC,
+  gas_used       INT64,
+  nonce          INT64,
+  input_bytes    STRING,
+  tx_hash        STRING,
+  day            DATE,
+  seed_addr      STRING
+)
+PARTITION BY day
+CLUSTER BY seed_addr, from_address, to_address;
+
+
+-- ==========================================================
+-- 16 БАТЧЕЙ (каждый добавляет свои 4 шарда в итоговую S3_e2_raw)
+-- ==========================================================
+
+-- ШАБЛОН: заменить диапазон в WHERE ... BETWEEN X AND Y
+--          (0–3, 4–7, ..., 60–63)
+
+-- ===== Батч 1: шарды 0–3 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 0 AND 3
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 2: шарды 4–7 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 4 AND 7
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 3: шарды 8–11 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 8 AND 11
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 4: шарды 12–15 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 12 AND 15
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 5: шарды 16–19 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 16 AND 19
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 6: шарды 20–23 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 20 AND 23
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 7: шарды 24–27 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 24 AND 27
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 8: шарды 28–31 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 28 AND 31
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 9: шарды 32–35 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 32 AND 35
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 10: шарды 36–39 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 36 AND 39
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 11: шарды 40–43 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 40 AND 43
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 12: шарды 44–47 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 44 AND 47
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 13: шарды 48–51 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 48 AND 51
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 14: шарды 52–55 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 52 AND 55
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 15: шарды 56–59 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 56 AND 59
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;
+
+-- ===== Батч 16: шарды 60–63 =====
+INSERT INTO `kinetic-physics-469205-b2.GNN2.S3_e2_raw`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `kinetic-physics-469205-b2.GNN2.S2_l1_top50`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 60 AND 63
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr
+  FROM `kinetic-physics-469205-b2.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l ON i.day = l.day AND i.addr = l.neighbor_addr
+)
+SELECT t.from_address, t.to_address, t.block_number, t.ts AS timestamp,
+       t.value_wei_raw, t.gas_price_wei, t.gas_used, t.nonce, t.input_bytes,
+       t.tx_hash, t.day, h.seed_addr
+FROM `kinetic-physics-469205-b2.GNN2.S3_tx_by_day` t
+JOIN hits h ON t.day = h.day AND t.tx_hash = h.tx_hash
+;

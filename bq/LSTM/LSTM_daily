@@ -1,0 +1,1874 @@
+-- =====================================================================
+-- Address Daily Features Pipeline (persistent tables per stage)
+-- Project: driven-airway-469812-v8
+-- Dataset: LSTM_daily
+-- Timezone: UTC
+-- =====================================================================
+
+-- 0) Создаём датасет для артефактов (если ещё нет)
+CREATE SCHEMA IF NOT EXISTS `driven-airway-469812-v8.LSTM_daily`;
+
+-- 1) base: адреса + границы активности
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.base` AS
+SELECT
+  LOWER(address) AS address,
+  is_scam,
+  description,
+  is_contract,
+  activity_start_ts,  -- TIMESTAMP
+  activity_end_ts     -- TIMESTAMP
+FROM `driven-airway-469812-v8.merged_accounts_base.base0_contracts_balanced_v1`
+WHERE activity_start_ts IS NOT NULL;
+
+-- 2) bounds: нормализуем конец (NULL -> сегодня 23:59:59), фильтр end>=start
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.bounds` AS
+SELECT
+  address, is_scam, description, is_contract,
+  activity_start_ts,
+  IFNULL(activity_end_ts, TIMESTAMP(DATETIME(CURRENT_DATE(), "23:59:59"))) AS activity_end_ts
+FROM `driven-airway-469812-v8.LSTM_daily.base`
+WHERE activity_end_ts IS NULL OR activity_end_ts >= activity_start_ts;
+
+-- 3) calendar: по дням от start..end (включительно)
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.calendar` AS
+SELECT
+  b.address,
+  b.is_scam,
+  b.description,
+  b.is_contract,
+  d AS day
+FROM `driven-airway-469812-v8.LSTM_daily.bounds` b,
+UNNEST(GENERATE_DATE_ARRAY(DATE(b.activity_start_ts), DATE(b.activity_end_ts))) AS d;
+
+-- 4) calendar_labeled: метки календаря + first_seen_day, age_days
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.calendar_labeled` AS
+WITH first_seen AS (
+  SELECT address, MIN(day) AS first_seen_day
+  FROM `driven-airway-469812-v8.LSTM_daily.calendar`
+  GROUP BY address
+)
+SELECT
+  c.address,
+  c.is_scam,
+  c.description,
+  c.is_contract,
+  c.day,
+  f.first_seen_day,
+  DATE_DIFF(c.day, f.first_seen_day, DAY) AS age_days,
+  -- 0=Пн..6=Вс
+  MOD(EXTRACT(DAYOFWEEK FROM c.day)+5, 7) AS dow,
+  CASE WHEN EXTRACT(DAYOFWEEK FROM c.day) IN (1,7) THEN 1 ELSE 0 END AS is_weekend,
+  CASE WHEN EXTRACT(DAY FROM c.day) = 1 THEN 1 ELSE 0 END AS is_month_start,
+  CASE
+    WHEN DATE_ADD(c.day, INTERVAL 1 DAY) = DATE_TRUNC(DATE_ADD(c.day, INTERVAL 1 DAY), MONTH) THEN 1
+    ELSE 0
+  END AS is_month_end
+FROM `driven-airway-469812-v8.LSTM_daily.calendar` c
+JOIN first_seen f USING (address);
+
+-- 5) tx_raw: normal transactions в окне календаря
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.tx_raw` AS
+SELECT
+  LOWER(from_address) AS from_addr,
+  LOWER(to_address)   AS to_addr,
+  DATE(block_timestamp) AS day,
+  SAFE_CAST(value AS NUMERIC) / 1e18 AS eth_value,              -- ETH
+  receipt_status                            AS status,
+  SAFE_CAST(receipt_gas_used AS INT64)      AS gas_used,
+  SAFE_CAST(receipt_effective_gas_price AS NUMERIC) / 1e9 AS gas_price_gwei,       -- gwei
+  SAFE_CAST(max_fee_per_gas AS NUMERIC) / 1e9              AS max_fee_per_gas_gwei, -- gwei
+  SAFE_CAST(max_priority_fee_per_gas AS NUMERIC) / 1e9     AS priority_fee_gwei,   -- gwei
+  block_timestamp
+FROM `bigquery-public-data.crypto_ethereum.transactions`
+WHERE DATE(block_timestamp) BETWEEN
+  (SELECT MIN(day) FROM `driven-airway-469812-v8.LSTM_daily.calendar`)
+  AND
+  (SELECT MAX(day) FROM `driven-airway-469812-v8.LSTM_daily.calendar`);
+
+-- 6) contracts_lu: справочник адресов контрактов
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.contracts_lu` AS
+SELECT DISTINCT LOWER(address) AS address
+FROM `bigquery-public-data.crypto_ethereum.contracts`;
+
+-- 7) sent_day: ежедневные исходящие по normal-tx (+разбиение по типу получателя)
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.sent_day` AS
+SELECT
+  t.from_addr AS address,
+  t.day,
+  COUNT(*)                           AS normal_sent_cnt,
+  COUNTIF(status = 0)                AS normal_failed_cnt,
+  SUM(eth_value)                     AS eth_sent_sum,
+  MAX(eth_value)                     AS eth_sent_max,
+  AVG(eth_value)                     AS eth_sent_avg,
+  -- комиссии: gas_used * effective_gas_price; (gwei → ETH через /1e9)
+  SUM( SAFE_CAST(gas_used AS NUMERIC) * gas_price_gwei ) / 1e9 AS tx_fee_eth_sum,
+  SUM(gas_used)                      AS gas_used_sum,
+  AVG(gas_price_gwei)                AS gas_price_avg_gwei,
+  AVG(max_fee_per_gas_gwei)          AS max_fee_per_gas_avg_gwei,
+  AVG(priority_fee_gwei)             AS priority_fee_avg_gwei,
+  COUNTIF(t.to_addr IS NOT NULL AND t.to_addr IN (SELECT address FROM `driven-airway-469812-v8.LSTM_daily.contracts_lu`))  AS normal_to_contract_cnt,
+  COUNTIF(t.to_addr IS NOT NULL AND t.to_addr NOT IN (SELECT address FROM `driven-airway-469812-v8.LSTM_daily.contracts_lu`)) AS normal_to_eoa_cnt,
+  ARRAY_AGG(block_timestamp ORDER BY block_timestamp) AS ts_list
+FROM `driven-airway-469812-v8.LSTM_daily.tx_raw` t
+WHERE t.from_addr IS NOT NULL
+GROUP BY address, day;
+
+-- 8) recv_day: ежедневные входящие по normal-tx
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.recv_day` AS
+SELECT
+  t.to_addr AS address,
+  t.day,
+  COUNT(*)       AS normal_recv_cnt,
+  SUM(eth_value) AS eth_recv_sum,
+  MAX(eth_value) AS eth_recv_max,
+  AVG(eth_value) AS eth_recv_avg,
+  ARRAY_AGG(block_timestamp ORDER BY block_timestamp) AS ts_list
+FROM `driven-airway-469812-v8.LSTM_daily.tx_raw` t
+WHERE t.to_addr IS NOT NULL
+GROUP BY address, day;
+
+-- 9) erc20_raw: ERC-20/721/1155 transfers (с токеном и днём)
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.erc20_raw` AS
+SELECT
+  LOWER(tt.from_address)  AS from_addr,
+  LOWER(tt.to_address)    AS to_addr,
+  LOWER(tt.token_address) AS token,
+  DATE(tt.block_timestamp) AS day
+FROM `bigquery-public-data.crypto_ethereum.token_transfers` tt
+WHERE DATE(tt.block_timestamp) BETWEEN
+  (SELECT MIN(day) FROM `driven-airway-469812-v8.LSTM_daily.calendar`)
+  AND
+  (SELECT MAX(day) FROM `driven-airway-469812-v8.LSTM_daily.calendar`);
+
+-- 10) erc20_sent_day / erc20_recv_day: дневные счётчики и число уникальных токенов
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.erc20_sent_day` AS
+SELECT
+  from_addr AS address,
+  day,
+  COUNT(*) AS erc20_sent_cnt,
+  COUNT(DISTINCT token) AS erc20_unique_tokens_sent
+FROM `driven-airway-469812-v8.LSTM_daily.erc20_raw`
+WHERE from_addr IS NOT NULL
+GROUP BY address, day;
+
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.erc20_recv_day` AS
+SELECT
+  to_addr AS address,
+  day,
+  COUNT(*) AS erc20_recv_cnt,
+  COUNT(DISTINCT token) AS erc20_unique_tokens_recv
+FROM `driven-airway-469812-v8.LSTM_daily.erc20_raw`
+WHERE to_addr IS NOT NULL
+GROUP BY address, day;
+
+-- 11) traces_raw: internal (успешные переводы ETH)
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.traces_raw` AS
+SELECT
+  LOWER(from_address) AS from_addr,
+  LOWER(to_address)   AS to_addr,
+  DATE(block_timestamp) AS day,
+  SAFE_CAST(value AS NUMERIC) / 1e18 AS eth_value,
+  status,
+  call_type,
+  block_timestamp
+FROM `bigquery-public-data.crypto_ethereum.traces`
+WHERE DATE(block_timestamp) BETWEEN
+  (SELECT MIN(day) FROM `driven-airway-469812-v8.LSTM_daily.calendar`)
+  AND
+  (SELECT MAX(day) FROM `driven-airway-469812-v8.LSTM_daily.calendar`);
+
+-- 12) internal_day: агрегаты по internal ETH
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.internal_day` AS
+SELECT
+  day,
+  address,
+  SUM(CASE WHEN dir='out' THEN 1 ELSE 0 END) AS internal_out_cnt,
+  SUM(CASE WHEN dir='in'  THEN 1 ELSE 0 END) AS internal_in_cnt,
+  SUM(CASE WHEN dir='out' THEN eth_value ELSE 0 END) AS internal_out_value_eth_sum,
+  SUM(CASE WHEN dir='in'  THEN eth_value ELSE 0 END) AS internal_in_value_eth_sum,
+  ARRAY_AGG(ts ORDER BY ts) AS ts_list
+FROM (
+  SELECT day, from_addr AS address, 'out' AS dir, eth_value, block_timestamp AS ts
+  FROM `driven-airway-469812-v8.LSTM_daily.traces_raw`
+  WHERE from_addr IS NOT NULL AND status = 1 AND eth_value > 0
+  UNION ALL
+  SELECT day, to_addr AS address, 'in' AS dir, eth_value, block_timestamp AS ts
+  FROM `driven-airway-469812-v8.LSTM_daily.traces_raw`
+  WHERE to_addr IS NOT NULL AND status = 1 AND eth_value > 0
+)
+GROUP BY day, address;
+
+-- 13) activity_ts: объединяем таймстемпы (send/recv/internal)
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.activity_ts` AS
+SELECT
+  a.address,
+  a.day,
+  ARRAY(
+    SELECT ts FROM UNNEST(
+      ARRAY_CONCAT(
+        IFNULL(s.ts_list, []),
+        IFNULL(r.ts_list, []),
+        IFNULL(i.ts_list, [])
+      )
+    ) ts ORDER BY ts
+  ) AS ts_all
+FROM `driven-airway-469812-v8.LSTM_daily.calendar_labeled` a
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.sent_day`    s USING (address, day)
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.recv_day`    r USING (address, day)
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.internal_day` i USING (address, day);
+
+-- 14) hourly_stats: почасовые корзины, пик, энтропия, span
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.hourly_stats` AS
+WITH exploded AS (
+  SELECT address, day, EXTRACT(HOUR FROM ts_elem) AS h
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts`,
+       UNNEST(ts_all) AS ts_elem
+),
+per_hour AS (
+  SELECT address, day, h, COUNT(*) AS cnt
+  FROM exploded
+  GROUP BY address, day, h
+),
+total AS (
+  SELECT address, day, SUM(cnt) AS total_cnt
+  FROM per_hour
+  GROUP BY address, day
+),
+peak AS (
+  SELECT p.address, p.day,
+         ARRAY_AGG(STRUCT(h, cnt) ORDER BY cnt DESC, h ASC LIMIT 1)[OFFSET(0)] AS top1
+  FROM per_hour p
+  GROUP BY p.address, p.day
+)
+SELECT
+  t.address,
+  t.day,
+  -- buckets
+  SUM(CASE WHEN p.h BETWEEN 0  AND 5  THEN p.cnt ELSE 0 END) AS tx_cnt_00_06,
+  SUM(CASE WHEN p.h BETWEEN 6  AND 11 THEN p.cnt ELSE 0 END) AS tx_cnt_06_12,
+  SUM(CASE WHEN p.h BETWEEN 12 AND 17 THEN p.cnt ELSE 0 END) AS tx_cnt_12_18,
+  SUM(CASE WHEN p.h BETWEEN 18 AND 23 THEN p.cnt ELSE 0 END) AS tx_cnt_18_24,
+  -- night share
+  SAFE_DIVIDE(SUM(CASE WHEN p.h BETWEEN 0 AND 5 THEN p.cnt ELSE 0 END), t.total_cnt) AS night_share,
+  -- peak hour & share
+  top1.h AS peak_hour,
+  SAFE_DIVIDE(top1.cnt, t.total_cnt) AS peak_hour_share,
+  -- entropy over 24 hours
+  CASE
+    WHEN t.total_cnt <= 1 THEN NULL
+    ELSE (
+      SELECT
+        -SUM( (c / t.total_cnt) * LN(c / t.total_cnt) ) / LN(24)
+      FROM (
+        SELECT h, SUM(cnt) AS c
+        FROM per_hour ph
+        WHERE ph.address = t.address AND ph.day = t.day
+        GROUP BY h
+      )
+    )
+  END AS activity_entropy_hours,
+  -- active_hour_span: разница между MIN и MAX таймстемпами дня (в часах)
+  CASE
+    WHEN t.total_cnt = 0 THEN 0
+    ELSE (
+      SELECT TIMESTAMP_DIFF(MAX(ts_elem), MIN(ts_elem), HOUR)
+      FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats,
+           UNNEST(ats.ts_all) AS ts_elem
+      WHERE ats.address = t.address AND ats.day = t.day
+    )
+  END AS active_hour_span
+FROM total t
+LEFT JOIN peak k
+  ON k.address = t.address AND k.day = t.day
+LEFT JOIN per_hour p
+  ON p.address = t.address AND p.day = t.day
+GROUP BY t.address, t.day, t.total_cnt, top1;
+
+
+-- 0) Снести старую таблицу
+DROP TABLE IF EXISTS `driven-airway-469812-v8.LSTM_daily.activity_ts`;
+
+-- 15) activity_ts: объединяем таймстемпы (tx send/recv + internal)
+CREATE TABLE `driven-airway-469812-v8.LSTM_daily.activity_ts`
+PARTITION BY day
+CLUSTER BY address AS
+SELECT
+  cal.address,
+  cal.day,
+  ARRAY(
+    SELECT ts
+    FROM UNNEST(
+      ARRAY_CONCAT(
+        IFNULL(s.ts_list, []),     -- исходящие normal-tx
+        IFNULL(r.ts_list, []),     -- входящие normal-tx
+        IFNULL(i.ts_list, [])      -- internal ETH
+      )
+    ) AS ts
+    WHERE ts IS NOT NULL
+    ORDER BY ts
+  ) AS ts_all
+FROM `driven-airway-469812-v8.LSTM_daily.calendar_labeled` cal
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.sent_day`     s ON cal.address = s.address AND cal.day = s.day
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.recv_day`     r ON cal.address = r.address AND cal.day = r.day
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.internal_day` i ON cal.address = i.address AND cal.day = i.day;
+
+
+
+
+-- Биржи/DEX/агрегаторы (подстрой паттерны под свои метки)
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.addr_labels.exchanges` AS
+SELECT DISTINCT LOWER(address) AS address
+FROM `driven-airway-469812-v8.merged_accounts_base.base0_contracts_balanced_v1`
+WHERE description IS NOT NULL
+  AND REGEXP_CONTAINS(LOWER(description),
+      r'(exchange|dex|binance|kraken|coinbase|okx|huobi|bybit|gate\.io|kucoin|mexc|uniswap|sushiswap|1inch|paraswap|balancer|curve)');
+
+-- Все остальные адреса
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.addr_labels.non_exchanges` AS
+SELECT DISTINCT LOWER(address) AS address
+FROM `driven-airway-469812-v8.merged_accounts_base.base0_contracts_balanced_v1`
+WHERE LOWER(address) NOT IN (
+  SELECT address FROM `driven-airway-469812-v8.addr_labels.exchanges`
+);
+
+
+-- ================================
+-- 16.1) Пустая целевая таблица для activity_stats
+-- Партиционируем по day и кластеризуем по address, чтобы ускорить последующие JOIN/оконные функции.
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.activity_stats`
+PARTITION BY day
+CLUSTER BY address AS
+SELECT
+  address,
+  day,
+  CAST(NULL AS NUMERIC) AS tx_interarrival_mean_min,  -- средний интервал (мин)
+  CAST(NULL AS NUMERIC) AS tx_interarrival_std_min,   -- ст. отклонение интервалов (мин)
+  CAST(0 AS INT64)      AS active_span_min,           -- размах активности в день (мин)
+  CAST(0 AS INT64)      AS burst_max_tx_5m,           -- max событий в любом 5-мин окне (FAST)
+  CAST(0 AS INT64)      AS sessions_cnt               -- 1 + #разрывов >30 мин
+FROM `driven-airway-469812-v8.LSTM_daily.activity_ts`
+WHERE 1=0;
+
+--HEAVY = exchanges (256 шардов, 8 батчей A–H)
+-- Во всех батчах — линейный burst (минутные корзины + оконка 5 минут).
+-- Можно запускать параллельно, батчи не должны пересекаться по диапазонам шардов.
+--
+-- Батч A (0-31)
+
+DELETE FROM `driven-airway-469812-v8.LSTM_daily.activity_stats`
+WHERE MOD(ABS(FARM_FINGERPRINT(address)), 256) BETWEEN 0 AND 31
+  AND address IN (SELECT address FROM `driven-airway-469812-v8.addr_labels.exchanges`);
+
+INSERT INTO `driven-airway-469812-v8.LSTM_daily.activity_stats` (
+  address, day,
+  tx_interarrival_mean_min, tx_interarrival_std_min,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+)
+WITH shards AS (
+  SELECT shard_k FROM UNNEST(GENERATE_ARRAY(0,255)) AS shard_k WHERE shard_k BETWEEN 0 AND 31
+),
+ats AS (
+  SELECT ats.address, ats.day, ats.ts_all
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats
+  JOIN `driven-airway-469812-v8.addr_labels.exchanges` e USING (address)
+  JOIN shards s ON MOD(ABS(FARM_FINGERPRINT(ats.address)),256) = s.shard_k
+  -- AND ats.day >= DATE '2024-01-01'
+),
+minute_bins AS (
+  SELECT address, day, TIMESTAMP_TRUNC(ts, MINUTE) AS m, COUNT(*) AS cnt
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day, m
+),
+-- границы по каждому (address, day)
+per_bounds AS (
+  SELECT
+    address,
+    day,
+    MIN(m) AS first_m,
+    MAX(m) AS last_m
+  FROM minute_bins
+  GROUP BY address, day
+),
+
+-- непрерывная минутная шкала
+minute_grid AS (
+  SELECT
+    b.address,
+    b.day,
+    m AS m
+  FROM per_bounds b,
+  UNNEST(GENERATE_TIMESTAMP_ARRAY(b.first_m, b.last_m, INTERVAL 1 MINUTE)) AS m
+),
+
+-- заполняем пропуски нулями
+minute_filled AS (
+  SELECT
+    g.address,
+    g.day,
+    g.m,
+    IFNULL(b.cnt, 0) AS cnt
+  FROM minute_grid g
+  LEFT JOIN minute_bins b
+    ON b.address = g.address
+   AND b.day     = g.day
+   AND b.m       = g.m
+),
+
+-- СКОЛЬЗЯЩЕЕ окно 5 минут по РЯДАМ (а не по RANGE)
+roll AS (
+  SELECT
+    address,
+    day,
+    m,
+    SUM(cnt) OVER (
+      PARTITION BY address, day
+      ORDER BY m
+      ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) AS cnt_5m
+  FROM minute_filled
+),
+
+-- быстрый burst
+burst_fast AS (
+  SELECT
+    address,
+    day,
+    MAX(cnt_5m) AS burst_max_tx_5m
+  FROM roll
+  GROUP BY address, day
+)
+SELECT
+  a.address, a.day,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT AVG(CAST(diff_min AS NUMERIC))
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_mean_min,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT SAFE_CAST(STDDEV(CAST(diff_min AS FLOAT64)) AS NUMERIC)
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_std_min,
+  CASE
+    WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN TIMESTAMP_DIFF(a.ts_all[OFFSET(ARRAY_LENGTH(a.ts_all)-1)], a.ts_all[OFFSET(0)], MINUTE)
+    WHEN ARRAY_LENGTH(a.ts_all) = 1 THEN 0 ELSE 0
+  END AS active_span_min,
+  COALESCE(b.burst_max_tx_5m, 0) AS burst_max_tx_5m,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 1 THEN 1 + (
+    SELECT COUNTIF(gap_min > 30) FROM (
+      SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE) AS gap_min
+      FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+    )
+  ) ELSE 0 END AS sessions_cnt
+FROM ats a
+LEFT JOIN burst_fast b USING (address, day);
+
+-- Батч B (32-63)
+
+DELETE FROM `driven-airway-469812-v8.LSTM_daily.activity_stats`
+WHERE MOD(ABS(FARM_FINGERPRINT(address)), 256) BETWEEN 32 AND 63
+  AND address IN (SELECT address FROM `driven-airway-469812-v8.addr_labels.exchanges`);
+
+INSERT INTO `driven-airway-469812-v8.LSTM_daily.activity_stats` (
+  address, day, tx_interarrival_mean_min, tx_interarrival_std_min,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+)
+WITH shards AS (
+  SELECT shard_k FROM UNNEST(GENERATE_ARRAY(0,255)) AS shard_k WHERE shard_k BETWEEN 32 AND 63
+),
+ats AS (
+  SELECT ats.address, ats.day, ats.ts_all
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats
+  JOIN `driven-airway-469812-v8.addr_labels.exchanges` e USING (address)
+  JOIN shards s ON MOD(ABS(FARM_FINGERPRINT(ats.address)),256) = s.shard_k
+),
+minute_bins AS (
+  SELECT address, day, TIMESTAMP_TRUNC(ts, MINUTE) AS m, COUNT(*) AS cnt
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day, m
+),
+-- границы по каждому (address, day)
+per_bounds AS (
+  SELECT
+    address,
+    day,
+    MIN(m) AS first_m,
+    MAX(m) AS last_m
+  FROM minute_bins
+  GROUP BY address, day
+),
+
+-- непрерывная минутная шкала
+minute_grid AS (
+  SELECT
+    b.address,
+    b.day,
+    m AS m
+  FROM per_bounds b,
+  UNNEST(GENERATE_TIMESTAMP_ARRAY(b.first_m, b.last_m, INTERVAL 1 MINUTE)) AS m
+),
+
+-- заполняем пропуски нулями
+minute_filled AS (
+  SELECT
+    g.address,
+    g.day,
+    g.m,
+    IFNULL(b.cnt, 0) AS cnt
+  FROM minute_grid g
+  LEFT JOIN minute_bins b
+    ON b.address = g.address
+   AND b.day     = g.day
+   AND b.m       = g.m
+),
+
+-- СКОЛЬЗЯЩЕЕ окно 5 минут по РЯДАМ (а не по RANGE)
+roll AS (
+  SELECT
+    address,
+    day,
+    m,
+    SUM(cnt) OVER (
+      PARTITION BY address, day
+      ORDER BY m
+      ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) AS cnt_5m
+  FROM minute_filled
+),
+
+-- быстрый burst
+burst_fast AS (
+  SELECT
+    address,
+    day,
+    MAX(cnt_5m) AS burst_max_tx_5m
+  FROM roll
+  GROUP BY address, day
+)
+SELECT
+  a.address, a.day,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT AVG(CAST(diff_min AS NUMERIC))
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_mean_min,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT SAFE_CAST(STDDEV(CAST(diff_min AS FLOAT64)) AS NUMERIC)
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_std_min,
+  CASE
+    WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN TIMESTAMP_DIFF(a.ts_all[OFFSET(ARRAY_LENGTH(a.ts_all)-1)], a.ts_all[OFFSET(0)], MINUTE)
+    WHEN ARRAY_LENGTH(a.ts_all) = 1 THEN 0 ELSE 0
+  END AS active_span_min,
+  COALESCE(b.burst_max_tx_5m, 0) AS burst_max_tx_5m,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 1 THEN 1 + (
+    SELECT COUNTIF(gap_min > 30) FROM (
+      SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE) AS gap_min
+      FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+    )
+  ) ELSE 0 END AS sessions_cnt
+FROM ats a
+LEFT JOIN burst_fast b USING (address, day);
+
+-- Батч C (64-95)
+
+DELETE FROM `driven-airway-469812-v8.LSTM_daily.activity_stats`
+WHERE MOD(ABS(FARM_FINGERPRINT(address)), 256) BETWEEN 64 AND 95
+  AND address IN (SELECT address FROM `driven-airway-469812-v8.addr_labels.exchanges`);
+
+INSERT INTO `driven-airway-469812-v8.LSTM_daily.activity_stats` (
+  address, day, tx_interarrival_mean_min, tx_interarrival_std_min,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+)
+WITH shards AS (
+  SELECT shard_k FROM UNNEST(GENERATE_ARRAY(0,255)) AS shard_k WHERE shard_k BETWEEN 64 AND 95
+),
+ats AS (
+  SELECT ats.address, ats.day, ats.ts_all
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats
+  JOIN `driven-airway-469812-v8.addr_labels.exchanges` e USING (address)
+  JOIN shards s ON MOD(ABS(FARM_FINGERPRINT(ats.address)),256) = s.shard_k
+),
+minute_bins AS (
+  SELECT address, day, TIMESTAMP_TRUNC(ts, MINUTE) AS m, COUNT(*) AS cnt
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day, m
+),
+-- границы по каждому (address, day)
+per_bounds AS (
+  SELECT
+    address,
+    day,
+    MIN(m) AS first_m,
+    MAX(m) AS last_m
+  FROM minute_bins
+  GROUP BY address, day
+),
+
+-- непрерывная минутная шкала
+minute_grid AS (
+  SELECT
+    b.address,
+    b.day,
+    m AS m
+  FROM per_bounds b,
+  UNNEST(GENERATE_TIMESTAMP_ARRAY(b.first_m, b.last_m, INTERVAL 1 MINUTE)) AS m
+),
+
+-- заполняем пропуски нулями
+minute_filled AS (
+  SELECT
+    g.address,
+    g.day,
+    g.m,
+    IFNULL(b.cnt, 0) AS cnt
+  FROM minute_grid g
+  LEFT JOIN minute_bins b
+    ON b.address = g.address
+   AND b.day     = g.day
+   AND b.m       = g.m
+),
+
+-- СКОЛЬЗЯЩЕЕ окно 5 минут по РЯДАМ (а не по RANGE)
+roll AS (
+  SELECT
+    address,
+    day,
+    m,
+    SUM(cnt) OVER (
+      PARTITION BY address, day
+      ORDER BY m
+      ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) AS cnt_5m
+  FROM minute_filled
+),
+
+-- быстрый burst
+burst_fast AS (
+  SELECT
+    address,
+    day,
+    MAX(cnt_5m) AS burst_max_tx_5m
+  FROM roll
+  GROUP BY address, day
+)
+SELECT
+  a.address, a.day,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT AVG(CAST(diff_min AS NUMERIC))
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_mean_min,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT SAFE_CAST(STDDEV(CAST(diff_min AS FLOAT64)) AS NUMERIC)
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_std_min,
+  CASE
+    WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN TIMESTAMP_DIFF(a.ts_all[OFFSET(ARRAY_LENGTH(a.ts_all)-1)], a.ts_all[OFFSET(0)], MINUTE)
+    WHEN ARRAY_LENGTH(a.ts_all) = 1 THEN 0 ELSE 0
+  END AS active_span_min,
+  COALESCE(b.burst_max_tx_5m, 0) AS burst_max_tx_5m,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 1 THEN 1 + (
+    SELECT COUNTIF(gap_min > 30) FROM (
+      SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE) AS gap_min
+      FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+    )
+  ) ELSE 0 END AS sessions_cnt
+FROM ats a
+LEFT JOIN burst_fast b USING (address, day);
+
+-- Батч D (96-127)
+
+DELETE FROM `driven-airway-469812-v8.LSTM_daily.activity_stats`
+WHERE MOD(ABS(FARM_FINGERPRINT(address)), 256) BETWEEN 96 AND 127
+  AND address IN (SELECT address FROM `driven-airway-469812-v8.addr_labels.exchanges`);
+
+INSERT INTO `driven-airway-469812-v8.LSTM_daily.activity_stats` (
+  address, day, tx_interarrival_mean_min, tx_interarrival_std_min,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+)
+WITH shards AS (
+  SELECT shard_k FROM UNNEST(GENERATE_ARRAY(0,255)) AS shard_k WHERE shard_k BETWEEN 96 AND 127
+),
+ats AS (
+  SELECT ats.address, ats.day, ats.ts_all
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats
+  JOIN `driven-airway-469812-v8.addr_labels.exchanges` e USING (address)
+  JOIN shards s ON MOD(ABS(FARM_FINGERPRINT(ats.address)),256) = s.shard_k
+),
+minute_bins AS (
+  SELECT address, day, TIMESTAMP_TRUNC(ts, MINUTE) AS m, COUNT(*) AS cnt
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day, m
+),
+-- границы по каждому (address, day)
+per_bounds AS (
+  SELECT
+    address,
+    day,
+    MIN(m) AS first_m,
+    MAX(m) AS last_m
+  FROM minute_bins
+  GROUP BY address, day
+),
+
+-- непрерывная минутная шкала
+minute_grid AS (
+  SELECT
+    b.address,
+    b.day,
+    m AS m
+  FROM per_bounds b,
+  UNNEST(GENERATE_TIMESTAMP_ARRAY(b.first_m, b.last_m, INTERVAL 1 MINUTE)) AS m
+),
+
+-- заполняем пропуски нулями
+minute_filled AS (
+  SELECT
+    g.address,
+    g.day,
+    g.m,
+    IFNULL(b.cnt, 0) AS cnt
+  FROM minute_grid g
+  LEFT JOIN minute_bins b
+    ON b.address = g.address
+   AND b.day     = g.day
+   AND b.m       = g.m
+),
+
+-- СКОЛЬЗЯЩЕЕ окно 5 минут по РЯДАМ (а не по RANGE)
+roll AS (
+  SELECT
+    address,
+    day,
+    m,
+    SUM(cnt) OVER (
+      PARTITION BY address, day
+      ORDER BY m
+      ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) AS cnt_5m
+  FROM minute_filled
+),
+
+-- быстрый burst
+burst_fast AS (
+  SELECT
+    address,
+    day,
+    MAX(cnt_5m) AS burst_max_tx_5m
+  FROM roll
+  GROUP BY address, day
+)
+SELECT
+  a.address, a.day,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT AVG(CAST(diff_min AS NUMERIC))
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_mean_min,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT SAFE_CAST(STDDEV(CAST(diff_min AS FLOAT64)) AS NUMERIC)
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_std_min,
+  CASE
+    WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN TIMESTAMP_DIFF(a.ts_all[OFFSET(ARRAY_LENGTH(a.ts_all)-1)], a.ts_all[OFFSET(0)], MINUTE)
+    WHEN ARRAY_LENGTH(a.ts_all) = 1 THEN 0 ELSE 0
+  END AS active_span_min,
+  COALESCE(b.burst_max_tx_5m, 0) AS burst_max_tx_5m,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 1 THEN 1 + (
+    SELECT COUNTIF(gap_min > 30) FROM (
+      SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE) AS gap_min
+      FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+    )
+  ) ELSE 0 END AS sessions_cnt
+FROM ats a
+LEFT JOIN burst_fast b USING (address, day);
+
+-- Батч E (128-159)
+
+DELETE FROM `driven-airway-469812-v8.LSTM_daily.activity_stats`
+WHERE MOD(ABS(FARM_FINGERPRINT(address)), 256) BETWEEN 128 AND 159
+  AND address IN (SELECT address FROM `driven-airway-469812-v8.addr_labels.exchanges`);
+
+INSERT INTO `driven-airway-469812-v8.LSTM_daily.activity_stats` (
+  address, day, tx_interarrival_mean_min, tx_interarrival_std_min,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+)
+WITH shards AS (
+  SELECT shard_k FROM UNNEST(GENERATE_ARRAY(0,255)) AS shard_k WHERE shard_k BETWEEN 128 AND 159
+),
+ats AS (
+  SELECT ats.address, ats.day, ats.ts_all
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats
+  JOIN `driven-airway-469812-v8.addr_labels.exchanges` e USING (address)
+  JOIN shards s ON MOD(ABS(FARM_FINGERPRINT(ats.address)),256) = s.shard_k
+),
+minute_bins AS (
+  SELECT address, day, TIMESTAMP_TRUNC(ts, MINUTE) AS m, COUNT(*) AS cnt
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day, m
+),
+-- границы по каждому (address, day)
+per_bounds AS (
+  SELECT
+    address,
+    day,
+    MIN(m) AS first_m,
+    MAX(m) AS last_m
+  FROM minute_bins
+  GROUP BY address, day
+),
+
+-- непрерывная минутная шкала
+minute_grid AS (
+  SELECT
+    b.address,
+    b.day,
+    m AS m
+  FROM per_bounds b,
+  UNNEST(GENERATE_TIMESTAMP_ARRAY(b.first_m, b.last_m, INTERVAL 1 MINUTE)) AS m
+),
+
+-- заполняем пропуски нулями
+minute_filled AS (
+  SELECT
+    g.address,
+    g.day,
+    g.m,
+    IFNULL(b.cnt, 0) AS cnt
+  FROM minute_grid g
+  LEFT JOIN minute_bins b
+    ON b.address = g.address
+   AND b.day     = g.day
+   AND b.m       = g.m
+),
+
+-- СКОЛЬЗЯЩЕЕ окно 5 минут по РЯДАМ (а не по RANGE)
+roll AS (
+  SELECT
+    address,
+    day,
+    m,
+    SUM(cnt) OVER (
+      PARTITION BY address, day
+      ORDER BY m
+      ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) AS cnt_5m
+  FROM minute_filled
+),
+
+-- быстрый burst
+burst_fast AS (
+  SELECT
+    address,
+    day,
+    MAX(cnt_5m) AS burst_max_tx_5m
+  FROM roll
+  GROUP BY address, day
+)
+SELECT
+  a.address, a.day,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT AVG(CAST(diff_min AS NUMERIC))
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_mean_min,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT SAFE_CAST(STDDEV(CAST(diff_min AS FLOAT64)) AS NUMERIC)
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_std_min,
+  CASE
+    WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN TIMESTAMP_DIFF(a.ts_all[OFFSET(ARRAY_LENGTH(a.ts_all)-1)], a.ts_all[OFFSET(0)], MINUTE)
+    WHEN ARRAY_LENGTH(a.ts_all) = 1 THEN 0 ELSE 0
+  END AS active_span_min,
+  COALESCE(b.burst_max_tx_5m, 0) AS burst_max_tx_5m,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 1 THEN 1 + (
+    SELECT COUNTIF(gap_min > 30) FROM (
+      SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE) AS gap_min
+      FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+    )
+  ) ELSE 0 END AS sessions_cnt
+FROM ats a
+LEFT JOIN burst_fast b USING (address, day);
+
+-- HEAVY F (exchanges): шарды 160..191 — фикс без GENERATE_ARRAY и с fast-burst
+DELETE FROM `driven-airway-469812-v8.LSTM_daily.activity_stats`
+WHERE MOD(ABS(FARM_FINGERPRINT(address)), 256) BETWEEN 160 AND 191
+  AND address IN (SELECT address FROM `driven-airway-469812-v8.addr_labels.exchanges`);
+--  AND day BETWEEN DATE '2024-01-01' AND CURRENT_DATE();  -- (рекомендуется для меньшего скана)
+
+INSERT INTO `driven-airway-469812-v8.LSTM_daily.activity_stats` (
+  address, day,
+  tx_interarrival_mean_min, tx_interarrival_std_min,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+)
+WITH shards AS (
+  SELECT shard_k
+  FROM UNNEST(GENERATE_ARRAY(160,191)) AS shard_k
+),
+
+-- Берём только нужные адреса/шарды
+ats AS (
+  SELECT ats.address, ats.day, ats.ts_all
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats
+  JOIN `driven-airway-469812-v8.addr_labels.exchanges` e USING (address)
+  JOIN shards s
+    ON MOD(ABS(FARM_FINGERPRINT(ats.address)), 256) = s.shard_k
+  -- AND ats.day BETWEEN DATE '2024-01-01' AND CURRENT_DATE()
+),
+
+-- ----- FAST BURST: минутные корзины → заполнение дыр нулями → 5-мин оконка по ROWS -----
+minute_bins AS (
+  SELECT
+    address,
+    day,
+    TIMESTAMP_TRUNC(ts, MINUTE) AS m,
+    COUNT(*) AS cnt
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day, m
+),
+per_bounds AS (
+  SELECT address, day, MIN(m) AS first_m, MAX(m) AS last_m
+  FROM minute_bins
+  GROUP BY address, day
+),
+minute_grid AS (
+  SELECT b.address, b.day, m
+  FROM per_bounds b,
+  UNNEST(GENERATE_TIMESTAMP_ARRAY(b.first_m, b.last_m, INTERVAL 1 MINUTE)) AS m
+),
+minute_filled AS (
+  SELECT g.address, g.day, g.m, IFNULL(b.cnt, 0) AS cnt
+  FROM minute_grid g
+  LEFT JOIN minute_bins b
+    ON b.address = g.address AND b.day = g.day AND b.m = g.m
+),
+roll AS (
+  SELECT
+    address, day, m,
+    SUM(cnt) OVER (
+      PARTITION BY address, day
+      ORDER BY m
+      ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) AS cnt_5m
+  FROM minute_filled
+),
+burst_fast AS (
+  SELECT address, day, MAX(cnt_5m) AS burst_max_tx_5m
+  FROM roll
+  GROUP BY address, day
+),
+
+-- ----- Интервалы между событиями БЕЗ GENERATE_ARRAY: LEAD() по развернутым ts -----
+events AS (
+  SELECT
+    address,
+    day,
+    COUNT(*) AS ev_cnt,
+    MIN(ts) AS first_ts,
+    MAX(ts) AS last_ts
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day
+),
+gaps AS (
+  SELECT
+    address,
+    day,
+    TIMESTAMP_DIFF(
+      LEAD(ts) OVER (PARTITION BY address, day ORDER BY ts),
+      ts,
+      MINUTE
+    ) AS gap_min
+  FROM ats, UNNEST(ts_all) AS ts
+),
+gaps_agg AS (
+  SELECT
+    address,
+    day,
+    -- средний интервал (мин) → NUMERIC
+    AVG(CAST(gap_min AS NUMERIC)) AS tx_interarrival_mean_min,
+    -- std (мин) → FLOAT64 → NUMERIC
+    SAFE_CAST(STDDEV(CAST(gap_min AS FLOAT64)) AS NUMERIC) AS tx_interarrival_std_min,
+    COUNTIF(gap_min > 30) AS gaps_gt_30
+  FROM gaps
+  WHERE gap_min IS NOT NULL
+  GROUP BY address, day
+)
+
+SELECT
+  a.address,
+  a.day,
+
+  -- средний/стд интервал (могут быть NULL, если <2 событий)
+  g.tx_interarrival_mean_min,
+  g.tx_interarrival_std_min,
+
+  -- span (мин): last - first; при 1 событии = 0; при 0 — 0
+  CASE
+    WHEN e.ev_cnt >= 2 THEN TIMESTAMP_DIFF(e.last_ts, e.first_ts, MINUTE)
+    WHEN e.ev_cnt = 1 THEN 0
+    ELSE 0
+  END AS active_span_min,
+
+  -- быстрый burst
+  COALESCE(b.burst_max_tx_5m, 0) AS burst_max_tx_5m,
+
+  -- сессии: 1 + #разрывов >30 мин (при наличии ≥1 события)
+  CASE
+    WHEN e.ev_cnt >= 1 THEN 1 + COALESCE(g.gaps_gt_30, 0)
+    ELSE 0
+  END AS sessions_cnt
+
+FROM (SELECT DISTINCT address, day FROM ats) a
+LEFT JOIN events    e USING (address, day)
+LEFT JOIN gaps_agg  g USING (address, day)
+LEFT JOIN burst_fast b USING (address, day);
+
+-- Батч G (192-223)
+
+DELETE FROM `driven-airway-469812-v8.LSTM_daily.activity_stats`
+WHERE MOD(ABS(FARM_FINGERPRINT(address)), 256) BETWEEN 192 AND 223
+  AND address IN (SELECT address FROM `driven-airway-469812-v8.addr_labels.exchanges`);
+
+INSERT INTO `driven-airway-469812-v8.LSTM_daily.activity_stats` (
+  address, day, tx_interarrival_mean_min, tx_interarrival_std_min,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+)
+WITH shards AS (
+  SELECT shard_k FROM UNNEST(GENERATE_ARRAY(0,255)) AS shard_k WHERE shard_k BETWEEN 192 AND 223
+),
+ats AS (
+  SELECT ats.address, ats.day, ats.ts_all
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats
+  JOIN `driven-airway-469812-v8.addr_labels.exchanges` e USING (address)
+  JOIN shards s ON MOD(ABS(FARM_FINGERPRINT(ats.address)),256) = s.shard_k
+),
+minute_bins AS (
+  SELECT address, day, TIMESTAMP_TRUNC(ts, MINUTE) AS m, COUNT(*) AS cnt
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day, m
+),
+-- границы по каждому (address, day)
+per_bounds AS (
+  SELECT
+    address,
+    day,
+    MIN(m) AS first_m,
+    MAX(m) AS last_m
+  FROM minute_bins
+  GROUP BY address, day
+),
+
+-- непрерывная минутная шкала
+minute_grid AS (
+  SELECT
+    b.address,
+    b.day,
+    m AS m
+  FROM per_bounds b,
+  UNNEST(GENERATE_TIMESTAMP_ARRAY(b.first_m, b.last_m, INTERVAL 1 MINUTE)) AS m
+),
+
+-- заполняем пропуски нулями
+minute_filled AS (
+  SELECT
+    g.address,
+    g.day,
+    g.m,
+    IFNULL(b.cnt, 0) AS cnt
+  FROM minute_grid g
+  LEFT JOIN minute_bins b
+    ON b.address = g.address
+   AND b.day     = g.day
+   AND b.m       = g.m
+),
+
+-- СКОЛЬЗЯЩЕЕ окно 5 минут по РЯДАМ (а не по RANGE)
+roll AS (
+  SELECT
+    address,
+    day,
+    m,
+    SUM(cnt) OVER (
+      PARTITION BY address, day
+      ORDER BY m
+      ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) AS cnt_5m
+  FROM minute_filled
+),
+
+-- быстрый burst
+burst_fast AS (
+  SELECT
+    address,
+    day,
+    MAX(cnt_5m) AS burst_max_tx_5m
+  FROM roll
+  GROUP BY address, day
+)
+SELECT
+  a.address, a.day,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT AVG(CAST(diff_min AS NUMERIC))
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_mean_min,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT SAFE_CAST(STDDEV(CAST(diff_min AS FLOAT64)) AS NUMERIC)
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_std_min,
+  CASE
+    WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN TIMESTAMP_DIFF(a.ts_all[OFFSET(ARRAY_LENGTH(a.ts_all)-1)], a.ts_all[OFFSET(0)], MINUTE)
+    WHEN ARRAY_LENGTH(a.ts_all) = 1 THEN 0 ELSE 0
+  END AS active_span_min,
+  COALESCE(b.burst_max_tx_5m, 0) AS burst_max_tx_5m,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 1 THEN 1 + (
+    SELECT COUNTIF(gap_min > 30) FROM (
+      SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE) AS gap_min
+      FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+    )
+  ) ELSE 0 END AS sessions_cnt
+FROM ats a
+LEFT JOIN burst_fast b USING (address, day);
+
+-- Батч H (224–255)
+
+DELETE FROM `driven-airway-469812-v8.LSTM_daily.activity_stats`
+WHERE MOD(ABS(FARM_FINGERPRINT(address)), 256) BETWEEN 224 AND 255
+  AND address IN (SELECT address FROM `driven-airway-469812-v8.addr_labels.exchanges`);
+
+INSERT INTO `driven-airway-469812-v8.LSTM_daily.activity_stats` (
+  address, day, tx_interarrival_mean_min, tx_interarrival_std_min,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+)
+WITH shards AS (
+  SELECT shard_k FROM UNNEST(GENERATE_ARRAY(0,255)) AS shard_k WHERE shard_k BETWEEN 224 AND 255
+),
+ats AS (
+  SELECT ats.address, ats.day, ats.ts_all
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats
+  JOIN `driven-airway-469812-v8.addr_labels.exchanges` e USING (address)
+  JOIN shards s ON MOD(ABS(FARM_FINGERPRINT(ats.address)),256) = s.shard_k
+),
+minute_bins AS (
+  SELECT address, day, TIMESTAMP_TRUNC(ts, MINUTE) AS m, COUNT(*) AS cnt
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day, m
+),
+-- границы по каждому (address, day)
+per_bounds AS (
+  SELECT
+    address,
+    day,
+    MIN(m) AS first_m,
+    MAX(m) AS last_m
+  FROM minute_bins
+  GROUP BY address, day
+),
+
+-- непрерывная минутная шкала
+minute_grid AS (
+  SELECT
+    b.address,
+    b.day,
+    m AS m
+  FROM per_bounds b,
+  UNNEST(GENERATE_TIMESTAMP_ARRAY(b.first_m, b.last_m, INTERVAL 1 MINUTE)) AS m
+),
+
+-- заполняем пропуски нулями
+minute_filled AS (
+  SELECT
+    g.address,
+    g.day,
+    g.m,
+    IFNULL(b.cnt, 0) AS cnt
+  FROM minute_grid g
+  LEFT JOIN minute_bins b
+    ON b.address = g.address
+   AND b.day     = g.day
+   AND b.m       = g.m
+),
+
+-- СКОЛЬЗЯЩЕЕ окно 5 минут по РЯДАМ (а не по RANGE)
+roll AS (
+  SELECT
+    address,
+    day,
+    m,
+    SUM(cnt) OVER (
+      PARTITION BY address, day
+      ORDER BY m
+      ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) AS cnt_5m
+  FROM minute_filled
+),
+
+-- быстрый burst
+burst_fast AS (
+  SELECT
+    address,
+    day,
+    MAX(cnt_5m) AS burst_max_tx_5m
+  FROM roll
+  GROUP BY address, day
+)
+SELECT
+  a.address, a.day,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT AVG(CAST(diff_min AS NUMERIC))
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_mean_min,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT SAFE_CAST(STDDEV(CAST(diff_min AS FLOAT64)) AS NUMERIC)
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_std_min,
+  CASE
+    WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN TIMESTAMP_DIFF(a.ts_all[OFFSET(ARRAY_LENGTH(a.ts_all)-1)], a.ts_all[OFFSET(0)], MINUTE)
+    WHEN ARRAY_LENGTH(a.ts_all) = 1 THEN 0 ELSE 0
+  END AS active_span_min,
+  COALESCE(b.burst_max_tx_5m, 0) AS burst_max_tx_5m,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 1 THEN 1 + (
+    SELECT COUNTIF(gap_min > 30) FROM (
+      SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE) AS gap_min
+      FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+    )
+  ) ELSE 0 END AS sessions_cnt
+FROM ats a
+LEFT JOIN burst_fast b USING (address, day);
+
+-- --------------------------------------
+-- NON_EXCHANGES батчи
+--
+-- Батч A (0–15)
+
+DELETE FROM `driven-airway-469812-v8.LSTM_daily.activity_stats`
+WHERE MOD(ABS(FARM_FINGERPRINT(address)), 64) BETWEEN 0 AND 15
+  AND address IN (SELECT address FROM `driven-airway-469812-v8.addr_labels.non_exchanges`);
+
+INSERT INTO `driven-airway-469812-v8.LSTM_daily.activity_stats` (
+  address, day,
+  tx_interarrival_mean_min, tx_interarrival_std_min,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+)
+WITH shards AS (
+  SELECT shard_k FROM UNNEST(GENERATE_ARRAY(0,63)) AS shard_k WHERE shard_k BETWEEN 0 AND 15
+),
+ats AS (
+  SELECT ats.address, ats.day, ats.ts_all
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats
+  JOIN `driven-airway-469812-v8.addr_labels.non_exchanges` ne USING (address)
+  JOIN shards s ON MOD(ABS(FARM_FINGERPRINT(ats.address)),64) = s.shard_k
+  -- AND ats.day >= DATE '2024-01-01'
+),
+minute_bins AS (
+  SELECT address, day, TIMESTAMP_TRUNC(ts, MINUTE) AS m, COUNT(*) AS cnt
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day, m
+),
+-- границы по каждому (address, day)
+per_bounds AS (
+  SELECT
+    address,
+    day,
+    MIN(m) AS first_m,
+    MAX(m) AS last_m
+  FROM minute_bins
+  GROUP BY address, day
+),
+
+-- непрерывная минутная шкала
+minute_grid AS (
+  SELECT
+    b.address,
+    b.day,
+    m AS m
+  FROM per_bounds b,
+  UNNEST(GENERATE_TIMESTAMP_ARRAY(b.first_m, b.last_m, INTERVAL 1 MINUTE)) AS m
+),
+
+-- заполняем пропуски нулями
+minute_filled AS (
+  SELECT
+    g.address,
+    g.day,
+    g.m,
+    IFNULL(b.cnt, 0) AS cnt
+  FROM minute_grid g
+  LEFT JOIN minute_bins b
+    ON b.address = g.address
+   AND b.day     = g.day
+   AND b.m       = g.m
+),
+
+-- СКОЛЬЗЯЩЕЕ окно 5 минут по РЯДАМ (а не по RANGE)
+roll AS (
+  SELECT
+    address,
+    day,
+    m,
+    SUM(cnt) OVER (
+      PARTITION BY address, day
+      ORDER BY m
+      ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) AS cnt_5m
+  FROM minute_filled
+),
+
+-- быстрый burst
+burst_fast AS (
+  SELECT
+    address,
+    day,
+    MAX(cnt_5m) AS burst_max_tx_5m
+  FROM roll
+  GROUP BY address, day
+)
+SELECT
+  a.address, a.day,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT AVG(CAST(diff_min AS NUMERIC))
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_mean_min,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT SAFE_CAST(STDDEV(CAST(diff_min AS FLOAT64)) AS NUMERIC)
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_std_min,
+  CASE
+    WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN TIMESTAMP_DIFF(a.ts_all[OFFSET(ARRAY_LENGTH(a.ts_all)-1)], a.ts_all[OFFSET(0)], MINUTE)
+    WHEN ARRAY_LENGTH(a.ts_all) = 1 THEN 0 ELSE 0
+  END AS active_span_min,
+  COALESCE(b.burst_max_tx_5m, 0) AS burst_max_tx_5m,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 1 THEN 1 + (
+    SELECT COUNTIF(gap_min > 30) FROM (
+      SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE) AS gap_min
+      FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+    )
+  ) ELSE 0 END AS sessions_cnt
+FROM ats a
+LEFT JOIN burst_fast b USING (address, day);
+
+-- Батч B (16–31)
+
+DELETE FROM `driven-airway-469812-v8.LSTM_daily.activity_stats`
+WHERE MOD(ABS(FARM_FINGERPRINT(address)), 64) BETWEEN 16 AND 31
+  AND address IN (SELECT address FROM `driven-airway-469812-v8.addr_labels.non_exchanges`);
+
+INSERT INTO `driven-airway-469812-v8.LSTM_daily.activity_stats` (
+  address, day,
+  tx_interarrival_mean_min, tx_interarrival_std_min,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+)
+WITH shards AS (
+  SELECT shard_k FROM UNNEST(GENERATE_ARRAY(0,63)) AS shard_k WHERE shard_k BETWEEN 16 AND 31
+),
+ats AS (
+  SELECT ats.address, ats.day, ats.ts_all
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats
+  JOIN `driven-airway-469812-v8.addr_labels.non_exchanges` ne USING (address)
+  JOIN shards s ON MOD(ABS(FARM_FINGERPRINT(ats.address)),64) = s.shard_k
+  -- AND ats.day >= DATE '2024-01-01'
+),
+minute_bins AS (
+  SELECT address, day, TIMESTAMP_TRUNC(ts, MINUTE) AS m, COUNT(*) AS cnt
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day, m
+),
+-- границы по каждому (address, day)
+per_bounds AS (
+  SELECT
+    address,
+    day,
+    MIN(m) AS first_m,
+    MAX(m) AS last_m
+  FROM minute_bins
+  GROUP BY address, day
+),
+
+-- непрерывная минутная шкала
+minute_grid AS (
+  SELECT
+    b.address,
+    b.day,
+    m AS m
+  FROM per_bounds b,
+  UNNEST(GENERATE_TIMESTAMP_ARRAY(b.first_m, b.last_m, INTERVAL 1 MINUTE)) AS m
+),
+
+-- заполняем пропуски нулями
+minute_filled AS (
+  SELECT
+    g.address,
+    g.day,
+    g.m,
+    IFNULL(b.cnt, 0) AS cnt
+  FROM minute_grid g
+  LEFT JOIN minute_bins b
+    ON b.address = g.address
+   AND b.day     = g.day
+   AND b.m       = g.m
+),
+
+-- СКОЛЬЗЯЩЕЕ окно 5 минут по РЯДАМ (а не по RANGE)
+roll AS (
+  SELECT
+    address,
+    day,
+    m,
+    SUM(cnt) OVER (
+      PARTITION BY address, day
+      ORDER BY m
+      ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) AS cnt_5m
+  FROM minute_filled
+),
+
+-- быстрый burst
+burst_fast AS (
+  SELECT
+    address,
+    day,
+    MAX(cnt_5m) AS burst_max_tx_5m
+  FROM roll
+  GROUP BY address, day
+)
+SELECT
+  a.address, a.day,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT AVG(CAST(diff_min AS NUMERIC))
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_mean_min,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT SAFE_CAST(STDDEV(CAST(diff_min AS FLOAT64)) AS NUMERIC)
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_std_min,
+  CASE
+    WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN TIMESTAMP_DIFF(a.ts_all[OFFSET(ARRAY_LENGTH(a.ts_all)-1)], a.ts_all[OFFSET(0)], MINUTE)
+    WHEN ARRAY_LENGTH(a.ts_all) = 1 THEN 0 ELSE 0
+  END AS active_span_min,
+  COALESCE(b.burst_max_tx_5m, 0) AS burst_max_tx_5m,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 1 THEN 1 + (
+    SELECT COUNTIF(gap_min > 30) FROM (
+      SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE) AS gap_min
+      FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+    )
+  ) ELSE 0 END AS sessions_cnt
+FROM ats a
+LEFT JOIN burst_fast b USING (address, day);
+
+
+-- Батч C (32-47)
+
+DELETE FROM `driven-airway-469812-v8.LSTM_daily.activity_stats`
+WHERE MOD(ABS(FARM_FINGERPRINT(address)), 64) BETWEEN 32 AND 47
+  AND address IN (SELECT address FROM `driven-airway-469812-v8.addr_labels.non_exchanges`);
+
+INSERT INTO `driven-airway-469812-v8.LSTM_daily.activity_stats` (
+  address, day,
+  tx_interarrival_mean_min, tx_interarrival_std_min,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+)
+WITH shards AS (
+  SELECT shard_k FROM UNNEST(GENERATE_ARRAY(0,63)) AS shard_k WHERE shard_k BETWEEN 32 AND 47
+),
+ats AS (
+  SELECT ats.address, ats.day, ats.ts_all
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats
+  JOIN `driven-airway-469812-v8.addr_labels.non_exchanges` ne USING (address)
+  JOIN shards s ON MOD(ABS(FARM_FINGERPRINT(ats.address)),64) = s.shard_k
+  -- AND ats.day >= DATE '2024-01-01'
+),
+minute_bins AS (
+  SELECT address, day, TIMESTAMP_TRUNC(ts, MINUTE) AS m, COUNT(*) AS cnt
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day, m
+),
+-- границы по каждому (address, day)
+per_bounds AS (
+  SELECT
+    address,
+    day,
+    MIN(m) AS first_m,
+    MAX(m) AS last_m
+  FROM minute_bins
+  GROUP BY address, day
+),
+
+-- непрерывная минутная шкала
+minute_grid AS (
+  SELECT
+    b.address,
+    b.day,
+    m AS m
+  FROM per_bounds b,
+  UNNEST(GENERATE_TIMESTAMP_ARRAY(b.first_m, b.last_m, INTERVAL 1 MINUTE)) AS m
+),
+
+-- заполняем пропуски нулями
+minute_filled AS (
+  SELECT
+    g.address,
+    g.day,
+    g.m,
+    IFNULL(b.cnt, 0) AS cnt
+  FROM minute_grid g
+  LEFT JOIN minute_bins b
+    ON b.address = g.address
+   AND b.day     = g.day
+   AND b.m       = g.m
+),
+
+-- СКОЛЬЗЯЩЕЕ окно 5 минут по РЯДАМ (а не по RANGE)
+roll AS (
+  SELECT
+    address,
+    day,
+    m,
+    SUM(cnt) OVER (
+      PARTITION BY address, day
+      ORDER BY m
+      ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) AS cnt_5m
+  FROM minute_filled
+),
+
+-- быстрый burst
+burst_fast AS (
+  SELECT
+    address,
+    day,
+    MAX(cnt_5m) AS burst_max_tx_5m
+  FROM roll
+  GROUP BY address, day
+)
+SELECT
+  a.address, a.day,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT AVG(CAST(diff_min AS NUMERIC))
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_mean_min,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT SAFE_CAST(STDDEV(CAST(diff_min AS FLOAT64)) AS NUMERIC)
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_std_min,
+  CASE
+    WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN TIMESTAMP_DIFF(a.ts_all[OFFSET(ARRAY_LENGTH(a.ts_all)-1)], a.ts_all[OFFSET(0)], MINUTE)
+    WHEN ARRAY_LENGTH(a.ts_all) = 1 THEN 0 ELSE 0
+  END AS active_span_min,
+  COALESCE(b.burst_max_tx_5m, 0) AS burst_max_tx_5m,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 1 THEN 1 + (
+    SELECT COUNTIF(gap_min > 30) FROM (
+      SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE) AS gap_min
+      FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+    )
+  ) ELSE 0 END AS sessions_cnt
+FROM ats a
+LEFT JOIN burst_fast b USING (address, day);
+
+
+-- Батч D (48–63)
+
+DELETE FROM `driven-airway-469812-v8.LSTM_daily.activity_stats`
+WHERE MOD(ABS(FARM_FINGERPRINT(address)), 64) BETWEEN 48 AND 63
+  AND address IN (SELECT address FROM `driven-airway-469812-v8.addr_labels.non_exchanges`);
+
+INSERT INTO `driven-airway-469812-v8.LSTM_daily.activity_stats` (
+  address, day,
+  tx_interarrival_mean_min, tx_interarrival_std_min,
+  active_span_min, burst_max_tx_5m, sessions_cnt
+)
+WITH shards AS (
+  SELECT shard_k FROM UNNEST(GENERATE_ARRAY(0,63)) AS shard_k WHERE shard_k BETWEEN 48 AND 63
+),
+ats AS (
+  SELECT ats.address, ats.day, ats.ts_all
+  FROM `driven-airway-469812-v8.LSTM_daily.activity_ts` ats
+  JOIN `driven-airway-469812-v8.addr_labels.non_exchanges` ne USING (address)
+  JOIN shards s ON MOD(ABS(FARM_FINGERPRINT(ats.address)),64) = s.shard_k
+  -- AND ats.day >= DATE '2024-01-01'
+),
+minute_bins AS (
+  SELECT address, day, TIMESTAMP_TRUNC(ts, MINUTE) AS m, COUNT(*) AS cnt
+  FROM ats, UNNEST(ts_all) AS ts
+  GROUP BY address, day, m
+),
+-- границы по каждому (address, day)
+per_bounds AS (
+  SELECT
+    address,
+    day,
+    MIN(m) AS first_m,
+    MAX(m) AS last_m
+  FROM minute_bins
+  GROUP BY address, day
+),
+
+-- непрерывная минутная шкала
+minute_grid AS (
+  SELECT
+    b.address,
+    b.day,
+    m AS m
+  FROM per_bounds b,
+  UNNEST(GENERATE_TIMESTAMP_ARRAY(b.first_m, b.last_m, INTERVAL 1 MINUTE)) AS m
+),
+
+-- заполняем пропуски нулями
+minute_filled AS (
+  SELECT
+    g.address,
+    g.day,
+    g.m,
+    IFNULL(b.cnt, 0) AS cnt
+  FROM minute_grid g
+  LEFT JOIN minute_bins b
+    ON b.address = g.address
+   AND b.day     = g.day
+   AND b.m       = g.m
+),
+
+-- СКОЛЬЗЯЩЕЕ окно 5 минут по РЯДАМ (а не по RANGE)
+roll AS (
+  SELECT
+    address,
+    day,
+    m,
+    SUM(cnt) OVER (
+      PARTITION BY address, day
+      ORDER BY m
+      ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) AS cnt_5m
+  FROM minute_filled
+),
+
+-- быстрый burst
+burst_fast AS (
+  SELECT
+    address,
+    day,
+    MAX(cnt_5m) AS burst_max_tx_5m
+  FROM roll
+  GROUP BY address, day
+)
+SELECT
+  a.address, a.day,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT AVG(CAST(diff_min AS NUMERIC))
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_mean_min,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN (
+    SELECT SAFE_CAST(STDDEV(CAST(diff_min AS FLOAT64)) AS NUMERIC)
+    FROM UNNEST((
+      SELECT ARRAY(
+        SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE)
+        FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+      )
+    )) AS diff_min
+  ) ELSE NULL END AS tx_interarrival_std_min,
+  CASE
+    WHEN ARRAY_LENGTH(a.ts_all) >= 2 THEN TIMESTAMP_DIFF(a.ts_all[OFFSET(ARRAY_LENGTH(a.ts_all)-1)], a.ts_all[OFFSET(0)], MINUTE)
+    WHEN ARRAY_LENGTH(a.ts_all) = 1 THEN 0 ELSE 0
+  END AS active_span_min,
+  COALESCE(b.burst_max_tx_5m, 0) AS burst_max_tx_5m,
+  CASE WHEN ARRAY_LENGTH(a.ts_all) >= 1 THEN 1 + (
+    SELECT COUNTIF(gap_min > 30) FROM (
+      SELECT TIMESTAMP_DIFF(a.ts_all[OFFSET(i+1)], a.ts_all[OFFSET(i)], MINUTE) AS gap_min
+      FROM UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(a.ts_all)-2)) AS i
+    )
+  ) ELSE 0 END AS sessions_cnt
+FROM ats a
+LEFT JOIN burst_fast b USING (address, day);
+
+
+-- 17) daily_core: объединяем все дневные метрики
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.daily_core` AS
+SELECT
+  cal.address,
+  cal.day,
+  cal.is_contract,
+  cal.first_seen_day,
+  cal.age_days,
+  cal.dow,
+  cal.is_weekend,
+  cal.is_month_start,
+  cal.is_month_end,
+
+  IFNULL(s.normal_sent_cnt, 0) AS normal_sent_cnt,
+  IFNULL(r.normal_recv_cnt, 0) AS normal_recv_cnt,
+  IFNULL(s.normal_sent_cnt, 0) + IFNULL(r.normal_recv_cnt, 0) AS normal_total_cnt,
+  IFNULL(s.normal_failed_cnt, 0) AS normal_failed_cnt,
+  IFNULL(s.normal_to_contract_cnt, 0) AS normal_to_contract_cnt,
+  IFNULL(s.normal_to_eoa_cnt, 0) AS normal_to_eoa_cnt,
+
+  IFNULL(s.eth_sent_sum, 0) AS eth_sent_sum,
+  IFNULL(r.eth_recv_sum, 0) AS eth_recv_sum,
+  IFNULL(r.eth_recv_sum, 0) - IFNULL(s.eth_sent_sum, 0) AS eth_net_flow,
+
+  s.eth_sent_max AS eth_sent_max,
+  s.eth_sent_avg AS eth_sent_avg,
+  r.eth_recv_max AS eth_recv_max,
+  r.eth_recv_avg AS eth_recv_avg,
+
+  IFNULL(s.tx_fee_eth_sum, 0) AS tx_fee_eth_sum,
+  IFNULL(s.gas_used_sum, 0)   AS gas_used_sum,
+  s.gas_price_avg_gwei        AS gas_price_avg_gwei,
+  s.max_fee_per_gas_avg_gwei  AS max_fee_per_gas_avg_gwei,
+  s.priority_fee_avg_gwei     AS priority_fee_avg_gwei,
+
+  IFNULL(es.erc20_sent_cnt, 0)             AS erc20_sent_cnt,
+  IFNULL(er.erc20_recv_cnt, 0)             AS erc20_recv_cnt,
+  IFNULL(es.erc20_sent_cnt, 0) + IFNULL(er.erc20_recv_cnt, 0) AS erc20_total_cnt,
+  IFNULL(es.erc20_unique_tokens_sent, 0)   AS erc20_unique_tokens_sent,
+  IFNULL(er.erc20_unique_tokens_recv, 0)   AS erc20_unique_tokens_recv,
+
+  IFNULL(int.internal_out_cnt, 0)             AS internal_out_cnt,
+  IFNULL(int.internal_in_cnt, 0)              AS internal_in_cnt,
+  IFNULL(int.internal_out_value_eth_sum, 0)   AS internal_out_value_eth_sum,
+  IFNULL(int.internal_in_value_eth_sum, 0)    AS internal_in_value_eth_sum,
+
+  IFNULL(pe.uniq_peers_cnt, 0)            AS uniq_peers_cnt,
+  IFNULL(pe.uniq_contract_peers_cnt, 0)   AS uniq_contract_peers_cnt,
+  IFNULL(pe.uniq_eoa_peers_cnt, 0)        AS uniq_eoa_peers_cnt,
+
+  ast.tx_interarrival_mean_min,
+  ast.tx_interarrival_std_min,
+  ast.active_span_min,
+  ast.burst_max_tx_5m,
+  ast.sessions_cnt,
+
+  hs.tx_cnt_00_06,
+  hs.tx_cnt_06_12,
+  hs.tx_cnt_12_18,
+  hs.tx_cnt_18_24,
+  hs.night_share,
+  hs.peak_hour,
+  hs.peak_hour_share,
+  hs.activity_entropy_hours,
+  hs.active_hour_span
+FROM `driven-airway-469812-v8.LSTM_daily.calendar_labeled` cal
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.sent_day`         s   USING (address, day)
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.recv_day`         r   USING (address, day)
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.erc20_sent_day`   es  USING (address, day)
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.erc20_recv_day`   er  USING (address, day)
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.internal_day`     int USING (address, day)
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.peers_day`        pe  USING (address, day)
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.activity_stats`   ast USING (address, day)
+LEFT JOIN `driven-airway-469812-v8.LSTM_daily.hourly_stats`     hs  USING (address, day);
+
+-- 18) daily_final: добавляем "сдвиги" к вчерашнему дню
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.LSTM_daily.daily_final` AS
+SELECT
+  d.*,
+  (d.peak_hour - LAG(d.peak_hour) OVER (PARTITION BY d.address ORDER BY d.day)) AS shift_peak_hour,
+  (d.night_share - LAG(d.night_share) OVER (PARTITION BY d.address ORDER BY d.day)) AS shift_night_share,
+  (d.activity_entropy_hours - LAG(d.activity_entropy_hours) OVER (PARTITION BY d.address ORDER BY d.day)) AS shift_activity_entropy
+FROM `driven-airway-469812-v8.LSTM_daily.daily_core` d
+ORDER BY d.address, d.day;
+
+-- =====================================================================
+-- Финальный результат: driven-airway-469812-v8.LSTM_daily.daily_final
+-- Промежуточные (для перезапуска с этапа):
+--   base, bounds, calendar, calendar_labeled,
+--   tx_raw, contracts_lu, sent_day, recv_day,
+--   erc20_raw, erc20_sent_day, erc20_recv_day,
+--   traces_raw, internal_day, activity_ts, hourly_stats,
+--   peers_day, activity_stats, daily_core
+-- =====================================================================

@@ -1,0 +1,62 @@
+SELECT
+  COUNTIF(is_contract IS NULL)/COUNT(*) AS is_contract_null_frac,
+  COUNTIF(first_seen_day IS NULL)/COUNT(*) AS first_seen_day_null_frac,
+  COUNTIF(age_days IS NULL)/COUNT(*) AS age_days_null_frac,
+  COUNTIF(dow IS NULL)/COUNT(*) AS dow_null_frac,
+  COUNTIF(is_weekend IS NULL)/COUNT(*) AS is_weekend_null_frac,
+  COUNTIF(is_month_start IS NULL)/COUNT(*) AS is_month_start_null_frac,
+  COUNTIF(is_month_end IS NULL)/COUNT(*) AS is_month_end_null_frac,
+  COUNTIF(normal_sent_cnt IS NULL)/COUNT(*) AS normal_sent_cnt_null_frac,
+  COUNTIF(normal_recv_cnt IS NULL)/COUNT(*) AS normal_recv_cnt_null_frac,
+  COUNTIF(normal_total_cnt IS NULL)/COUNT(*) AS normal_total_cnt_null_frac,
+  COUNTIF(normal_failed_cnt IS NULL)/COUNT(*) AS normal_failed_cnt_null_frac,
+  COUNTIF(normal_to_contract_cnt IS NULL)/COUNT(*) AS normal_to_contract_cnt_null_frac,
+  COUNTIF(normal_to_eoa_cnt IS NULL)/COUNT(*) AS normal_to_eoa_cnt_null_frac,
+  COUNTIF(eth_sent_sum IS NULL)/COUNT(*) AS eth_sent_sum_null_frac,
+  COUNTIF(eth_recv_sum IS NULL)/COUNT(*) AS eth_recv_sum_null_frac,
+  COUNTIF(eth_net_flow IS NULL)/COUNT(*) AS eth_net_flow_null_frac,
+  COUNTIF(eth_sent_max IS NULL)/COUNT(*) AS eth_sent_max_null_frac,
+  COUNTIF(eth_sent_avg IS NULL)/COUNT(*) AS eth_sent_avg_null_frac,
+  COUNTIF(eth_recv_max IS NULL)/COUNT(*) AS eth_recv_max_null_frac,
+  COUNTIF(eth_recv_avg IS NULL)/COUNT(*) AS eth_recv_avg_null_frac,
+  COUNTIF(tx_fee_eth_sum IS NULL)/COUNT(*) AS tx_fee_eth_sum_null_frac,
+  COUNTIF(gas_used_sum IS NULL)/COUNT(*) AS gas_used_sum_null_frac,
+  COUNTIF(gas_price_avg_gwei IS NULL)/COUNT(*) AS gas_price_avg_gwei_null_frac,
+  COUNTIF(max_fee_per_gas_avg_gwei IS NULL)/COUNT(*) AS max_fee_per_gas_avg_gwei_null_frac,
+  COUNTIF(priority_fee_avg_gwei IS NULL)/COUNT(*) AS priority_fee_avg_gwei_null_frac,
+  COUNTIF(erc20_sent_cnt IS NULL)/COUNT(*) AS erc20_sent_cnt_null_frac,
+  COUNTIF(erc20_recv_cnt IS NULL)/COUNT(*) AS erc20_recv_cnt_null_frac,
+  COUNTIF(erc20_total_cnt IS NULL)/COUNT(*) AS erc20_total_cnt_null_frac,
+  COUNTIF(erc20_unique_tokens_sent IS NULL)/COUNT(*) AS erc20_unique_tokens_sent_null_frac,
+  COUNTIF(erc20_unique_tokens_recv IS NULL)/COUNT(*) AS erc20_unique_tokens_recv_null_frac,
+  COUNTIF(internal_out_cnt IS NULL)/COUNT(*) AS internal_out_cnt_null_frac,
+  COUNTIF(internal_in_cnt IS NULL)/COUNT(*) AS internal_in_cnt_null_frac,
+  COUNTIF(internal_out_value_eth_sum IS NULL)/COUNT(*) AS internal_out_value_eth_sum_null_frac,
+  COUNTIF(internal_in_value_eth_sum IS NULL)/COUNT(*) AS internal_in_value_eth_sum_null_frac,
+  COUNTIF(uniq_peers_cnt IS NULL)/COUNT(*) AS uniq_peers_cnt_null_frac,
+  COUNTIF(uniq_contract_peers_cnt IS NULL)/COUNT(*) AS uniq_contract_peers_cnt_null_frac,
+  COUNTIF(uniq_eoa_peers_cnt IS NULL)/COUNT(*) AS uniq_eoa_peers_cnt_null_frac,
+  COUNTIF(tx_interarrival_mean_min IS NULL)/COUNT(*) AS tx_interarrival_mean_min_null_frac,
+  COUNTIF(tx_interarrival_std_min IS NULL)/COUNT(*) AS tx_interarrival_std_min_null_frac,
+  COUNTIF(active_span_min IS NULL)/COUNT(*) AS active_span_min_null_frac,
+  COUNTIF(burst_max_tx_5m IS NULL)/COUNT(*) AS burst_max_tx_5m_null_frac,
+  COUNTIF(sessions_cnt IS NULL)/COUNT(*) AS sessions_cnt_null_frac,
+  COUNTIF(tx_cnt_00_06 IS NULL)/COUNT(*) AS tx_cnt_00_06_null_frac,
+  COUNTIF(tx_cnt_06_12 IS NULL)/COUNT(*) AS tx_cnt_06_12_null_frac,
+  COUNTIF(tx_cnt_12_18 IS NULL)/COUNT(*) AS tx_cnt_12_18_null_frac,
+  COUNTIF(tx_cnt_18_24 IS NULL)/COUNT(*) AS tx_cnt_18_24_null_frac
+FROM `kinetic-physics-469205-b2.addr_daily.daily_final`;
+
+
+WITH stats AS (
+  SELECT
+    'normal_sent_cnt' AS col, COUNTIF(normal_sent_cnt = 0)/COUNT(*) AS zero_frac FROM `kinetic-physics-469205-b2.LSTM.daily_final_light` UNION ALL
+  SELECT 'normal_recv_cnt', COUNTIF(normal_recv_cnt = 0)/COUNT(*) FROM `kinetic-physics-469205-b2.LSTM.daily_final_light` UNION ALL
+  SELECT 'normal_total_cnt', COUNTIF(normal_total_cnt = 0)/COUNT(*) FROM `kinetic-physics-469205-b2.LSTM.daily_final_light` UNION ALL
+  SELECT 'erc20_total_cnt', COUNTIF(erc20_total_cnt = 0)/COUNT(*) FROM `kinetic-physics-469205-b2.LSTM.daily_final_light` UNION ALL
+  SELECT 'internal_in_cnt', COUNTIF(internal_in_cnt = 0)/COUNT(*) FROM `kinetic-physics-469205-b2.LSTM.daily_final_light` UNION ALL
+  SELECT 'internal_out_cnt', COUNTIF(internal_out_cnt = 0)/COUNT(*) FROM `kinetic-physics-469205-b2.LSTM.daily_final_light` UNION ALL
+  SELECT 'tx_fee_eth_sum', COUNTIF(tx_fee_eth_sum = 0)/COUNT(*) FROM `kinetic-physics-469205-b2.LSTM.daily_final_light` UNION ALL
+  SELECT 'burst_max_tx_5m', COUNTIF(burst_max_tx_5m = 0)/COUNT(*) FROM `kinetic-physics-469205-b2.LSTM.daily_final_light` 
+)
+SELECT * FROM stats ORDER BY zero_frac DESC;

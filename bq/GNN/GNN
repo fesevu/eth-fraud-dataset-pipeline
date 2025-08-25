@@ -1,0 +1,1205 @@
+-- S0: Семена (addresses + activity window)
+-- ЛИНЕЙНО. Можно добавить SHARD FILTER для батчей.
+
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.GNN2.S0_seeds`
+OPTIONS (description="Seeds: addresses with start/end of activity; lowercase") AS
+SELECT
+  LOWER(address) AS address,
+  activity_start_ts AS start_ts,
+  COALESCE(activity_end_ts, CURRENT_TIMESTAMP()) AS end_ts
+FROM `driven-airway-469812-v8.merged_accounts_base.base0_contracts_balanced_v1`
+WHERE activity_start_ts IS NOT NULL
+-- AND MOD(ABS(FARM_FINGERPRINT(LOWER(address))), 256) BETWEEN 0 AND 31  -- SHARD FILTER (optional)
+;
+
+-- S1: Первое ребро (L1): все сделки, где одна сторона — seed, и ts ∈ [start_ts,end_ts]
+-- ДВА semi-join'а + UNION ALL (быстрее, чем OR). ЛИНЕЙНО по E в периодах активности.
+
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.GNN2.S1_e1_raw`
+PARTITION BY day
+CLUSTER BY seed_addr, from_address, to_address AS
+WITH t AS (
+  SELECT
+    `hash` AS tx_hash,              -- 👈 оборачиваем в бектики
+    from_address,
+    to_address,
+    block_number,
+    block_timestamp AS ts,
+    value AS value_wei_raw,
+    gas_price AS gas_price_wei,
+    receipt_gas_used AS gas_used,
+    nonce,
+    input AS input_bytes
+  FROM `bigquery-public-data.crypto_ethereum.transactions`
+)
+SELECT
+  LOWER(t.from_address) AS from_address,
+  LOWER(t.to_address)   AS to_address,
+  t.block_number,
+  t.ts                  AS timestamp,
+  t.value_wei_raw,
+  t.gas_price_wei,
+  t.gas_used,
+  t.nonce,
+  t.input_bytes,
+  t.tx_hash,
+  DATE(t.ts)            AS day,
+  s.address             AS seed_addr
+FROM t
+JOIN `driven-airway-469812-v8.GNN2.S0_seeds` s
+  ON LOWER(t.from_address) = s.address
+ AND t.ts BETWEEN s.start_ts AND s.end_ts
+
+UNION ALL
+
+SELECT
+  LOWER(t.from_address),
+  LOWER(t.to_address),
+  t.block_number,
+  t.ts,
+  t.value_wei_raw,
+  t.gas_price_wei,
+  t.gas_used,
+  t.nonce,
+  t.input_bytes,
+  t.tx_hash,
+  DATE(t.ts),
+  s.address
+FROM t
+JOIN `driven-airway-469812-v8.GNN2.S0_seeds` s
+  ON LOWER(t.to_address) = s.address
+ AND t.ts BETWEEN s.start_ts AND s.end_ts
+;
+
+-- S2: Считаем суммарный вес (Wei) и свежесть по паре (seed, neighbor, day) → берём TOP 50.
+-- Критерий (оптимально для fraud): SUM(value_wei_raw) DESC, затем MAX(timestamp) DESC.
+-- Дет. tie-breaker: neighbor_addr ASC. ЛИНЕЙНО + сортировки в окнах (узкие).
+
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.GNN2.S2_l1_top15`
+PARTITION BY day
+CLUSTER BY seed_addr, neighbor_addr AS
+WITH pairs AS (
+  SELECT
+    seed_addr,
+    day,
+    CASE WHEN from_address = seed_addr THEN to_address ELSE from_address END AS neighbor_addr,
+    value_wei_raw,
+    timestamp
+  FROM `driven-airway-469812-v8.GNN2.S1_e1_raw`
+),
+scored AS (
+  SELECT
+    seed_addr,
+    neighbor_addr,
+    day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(timestamp)     AS last_ts
+  FROM pairs
+  GROUP BY seed_addr, neighbor_addr, day
+)
+SELECT seed_addr, neighbor_addr, day, sum_value_wei, last_ts
+FROM (
+  SELECT
+    seed_addr, neighbor_addr, day, sum_value_wei, last_ts,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 15;
+
+-- ==========================================================
+-- S3: Соседи второго уровня (L2)
+-- ----------------------------------------------------------
+-- На входе:
+--   • S2_l1_top15 — топ-15 соседей первого уровня (L1) для (seed, day)
+-- 
+-- Что делаем:
+--   1) Берём транзакции только за дни, где есть L1 (S3_tx_by_day).
+--   2) Строим индекс (S3_idx_addr_by_day) для ускорения поиска tx по addr.
+--   3) Через батчи (шардирование по hash(addr) % 64) ищем все адреса,
+--      которые связаны с L1 в этот день → это L2 кандидаты.
+--   4) Агрегируем по (seed, day, L2), считаем вес = SUM(value_wei_raw),
+--      свежесть = MAX(ts), частоту = COUNT(*).
+--   5) Оставляем TOP-5 L2 соседей на (seed, day).
+--
+-- Выход: S3_l2_top5
+-- ==========================================================
+-- Кэш: только дни, где есть L1-соседи (из S2_l1_top50)
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.GNN2.S3_tx_by_day`
+PARTITION BY day
+CLUSTER BY from_address, to_address AS
+WITH days AS (
+  SELECT DISTINCT day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+)
+SELECT
+  `hash`                AS tx_hash,
+  LOWER(from_address)   AS from_address,
+  LOWER(to_address)     AS to_address,
+  block_number,
+  block_timestamp       AS ts,
+  DATE(block_timestamp) AS day,
+  value                 AS value_wei_raw,
+  gas_price             AS gas_price_wei,
+  receipt_gas_used      AS gas_used,
+  nonce,
+  input                 AS input
+FROM `bigquery-public-data.crypto_ethereum.transactions`
+WHERE DATE(block_timestamp) IN (SELECT day FROM days);
+
+-- Узкий индекс для равенства JOIN (без взрыва по OR)
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day`
+PARTITION BY day
+CLUSTER BY addr AS
+SELECT DISTINCT day, from_address AS addr, tx_hash
+FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day`
+UNION ALL
+SELECT DISTINCT day, to_address   AS addr, tx_hash
+FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day`;
+
+-- создаём пустую таблицу с нужными колонками и схемой
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.GNN2.S3_l2_top5`
+(
+  seed_addr       STRING,
+  neighbor2_addr  STRING,
+  day             DATE,
+  sum_value_wei   NUMERIC,
+  last_ts         TIMESTAMP,
+  tx_cnt          INT64
+)
+PARTITION BY day
+CLUSTER BY seed_addr, neighbor2_addr;
+
+
+-- ===== Батч L2 #1: L1-шарды 0–3 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 0 AND 3
+),
+hits AS (
+  -- transactions где участвует L1-сосед (в этот день)
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  -- находим L2-адрес (противоположную сторону в транзакции)
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw AS value_wei_raw,
+    t.ts AS ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  -- агрегируем по (seed, day, L2)
+  SELECT
+    seed_addr,
+    neighbor2_addr,
+    day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+-- берём TOP-20 L2 на (seed, day)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #2: L1-шарды 4–7 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 4 AND 7
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #3: L1-шарды 8–11 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 8 AND 11
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #4: L1-шарды 12–15 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 12 AND 15
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #5: L1-шарды 16–19 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 16 AND 19
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #6: L1-шарды 20–23 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 20 AND 23
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #7: L1-шарды 24–27 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 24 AND 27
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #8: L1-шарды 28–31 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 28 AND 31
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #8: L1-шарды 32–35 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 32 AND 35
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #9: L1-шарды 36–39 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 36 AND 39
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #10: L1-шарды 40–43 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 40 AND 43
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #11: L1-шарды 44–47 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 44 AND 47
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #12: L1-шарды 48–51 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 48 AND 51
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #13: L1-шарды 52–55 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 52 AND 55
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #14: L1-шарды 56–59 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 56 AND 59
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- ===== Батч L2 #15: L1-шарды 60–63 =====
+INSERT INTO `driven-airway-469812-v8.GNN2.S3_l2_top5`
+WITH l1_sharded AS (
+  SELECT seed_addr, neighbor_addr, day
+  FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+  WHERE MOD(ABS(FARM_FINGERPRINT(neighbor_addr)), 64) BETWEEN 60 AND 63
+),
+hits AS (
+  SELECT i.day, i.tx_hash, l.seed_addr, l.neighbor_addr
+  FROM `driven-airway-469812-v8.GNN2.S3_idx_addr_by_day` i
+  JOIN l1_sharded l
+    ON i.day = l.day AND i.addr = l.neighbor_addr
+),
+pairs AS (
+  SELECT
+    h.seed_addr,
+    CASE
+      WHEN t.from_address = h.neighbor_addr THEN t.to_address
+      ELSE t.from_address
+    END AS neighbor2_addr,
+    t.day,
+    t.value_wei_raw,
+    t.ts
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN hits h
+    ON t.day = h.day AND t.tx_hash = h.tx_hash
+),
+scored AS (
+  SELECT
+    seed_addr, neighbor2_addr, day,
+    SUM(value_wei_raw) AS sum_value_wei,
+    MAX(ts)            AS last_ts,
+    COUNT(*)           AS tx_cnt
+  FROM pairs
+  GROUP BY seed_addr, neighbor2_addr, day
+)
+SELECT seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt
+FROM (
+  SELECT
+    seed_addr, neighbor2_addr, day, sum_value_wei, last_ts, tx_cnt,
+    ROW_NUMBER() OVER (
+      PARTITION BY seed_addr, day
+      ORDER BY sum_value_wei DESC, last_ts DESC, neighbor2_addr
+    ) AS rn
+  FROM scored
+)
+WHERE rn <= 5
+;
+
+-- S5: объединяем фронтир адресов для каждого seed и дня
+-- ЛИНЕЙНО, без широких джойнов
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.GNN2.S5_frontier_l1l2`
+PARTITION BY day
+CLUSTER BY seed_addr, addr AS
+SELECT seed_addr, day, neighbor_addr AS addr
+FROM `driven-airway-469812-v8.GNN2.S2_l1_top15`
+UNION ALL
+SELECT seed_addr, day, neighbor2_addr AS addr       -- <-- исправлено
+FROM `driven-airway-469812-v8.GNN2.S3_l2_top5`;
+
+-- S6: финальные транзакции для графа, точность — по дням
+-- ЛИНЕЙНО: равенства по ключам + партиции day
+-- КАП E2: ≤ 30 tx/день на пару (seed, day, L1, L2)
+
+-- CREATE OR REPLACE TABLE `driven-airway-469812-v8.GNN2.S6_final_tx_daily`
+-- PARTITION BY day
+-- CLUSTER BY from_address, to_address AS
+
+-- -- ---------------- E1: seed ↔ L1 ----------------
+-- SELECT
+--   from_address,
+--   to_address,
+--   block_number,
+--   timestamp,
+--   value_wei_raw,
+--   gas_price_wei,
+--   gas_used,
+--   nonce,
+--   input_bytes,
+--   tx_hash,
+--   day
+-- FROM `driven-airway-469812-v8.GNN2.S1_e1_raw`
+
+-- UNION ALL
+
+-- -- ---------------- E2 (ветка A): from = L1, to = выбранный L2 ----------------
+-- SELECT * EXCEPT(rn) FROM (
+--   SELECT
+--     t.from_address,
+--     t.to_address,
+--     t.block_number,
+--     t.ts                AS timestamp,
+--     t.value_wei_raw,
+--     t.gas_price_wei,
+--     t.gas_used,
+--     t.nonce,
+--     t.input             AS input_bytes,
+--     t.tx_hash,
+--     t.day,
+--     ROW_NUMBER() OVER (
+--       PARTITION BY l1.seed_addr, t.day, t.from_address, t.to_address
+--       ORDER BY t.value_wei_raw DESC, t.block_number DESC, t.tx_hash
+--     ) AS rn
+--   FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+--   JOIN `driven-airway-469812-v8.GNN2.S2_l1_top30` l1   -- если делал топ-30, просто поменяй на S2_l1_top30
+--     ON l1.day = t.day
+--    AND t.from_address = l1.neighbor_addr
+--   JOIN `driven-airway-469812-v8.GNN2.S3_l2_top10` l2   -- если делал топ-10, поменяй на S3_l2_top10
+--     ON l2.day = t.day
+--    AND l2.seed_addr = l1.seed_addr
+--    AND l2.neighbor2_addr = t.to_address
+-- )
+-- WHERE rn <= 30
+
+-- UNION ALL
+
+-- -- ---------------- E2 (ветка B): to = L1, from = выбранный L2 ----------------
+-- SELECT * EXCEPT(rn) FROM (
+--   SELECT
+--     t.from_address,
+--     t.to_address,
+--     t.block_number,
+--     t.ts                AS timestamp,
+--     t.value_wei_raw,
+--     t.gas_price_wei,
+--     t.gas_used,
+--     t.nonce,
+--     t.input             AS input_bytes,
+--     t.tx_hash,
+--     t.day,
+--     ROW_NUMBER() OVER (
+--       PARTITION BY l1.seed_addr, t.day, t.to_address, t.from_address
+--       ORDER BY t.value_wei_raw DESC, t.block_number DESC, t.tx_hash
+--     ) AS rn
+--   FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+--   JOIN `driven-airway-469812-v8.GNN2.S2_l1_top30` l1   -- если делал топ-30, поменяй на S2_l1_top30
+--     ON l1.day = t.day
+--    AND t.to_address = l1.neighbor_addr
+--   JOIN `driven-airway-469812-v8.GNN2.S3_l2_top10` l2   -- если делал топ-10, поменяй на S3_l2_top10
+--     ON l2.day = t.day
+--    AND l2.seed_addr = l1.seed_addr
+--    AND l2.neighbor2_addr = t.from_address
+-- )
+-- WHERE rn <= 30
+-- ;
+
+-- S6 (вариант B): финальные транзакции для графа (по дням)
+-- ЛИНЕЙНО: равенства по ключам + партиции day
+-- Правки:
+--   • L1 = 15 соседей/день  → используем S2_l1_top15
+--   • L2 = 5 соседей/день   → используем S3_l2_top5
+--   • КАП E2: ≤ 20 tx/день на пару (seed, day, L1, L2)
+--   • Анти-пыль: value_wei_raw >= 1e14 (~0.0001 ETH)
+
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.GNN2.S6_final_tx_daily`
+PARTITION BY day
+CLUSTER BY from_address, to_address AS
+
+-- ---------------- E1: seed ↔ L1 (фильтр "пыли") ----------------
+SELECT
+  from_address,
+  to_address,
+  block_number,
+  timestamp,
+  value_wei_raw,
+  gas_price_wei,
+  gas_used,
+  nonce,
+  input_bytes,
+  tx_hash,
+  day
+FROM `driven-airway-469812-v8.GNN2.S1_e1_raw`
+WHERE value_wei_raw >= 1e14   -- анти-пыль на E1
+
+UNION ALL
+
+-- ---------------- E2 (ветка A): from = L1, to = выбранный L2 ----------------
+SELECT * EXCEPT(rn) FROM (
+  SELECT
+    t.from_address,
+    t.to_address,
+    t.block_number,
+    t.ts                AS timestamp,
+    t.value_wei_raw,
+    t.gas_price_wei,
+    t.gas_used,
+    t.nonce,
+    t.input             AS input_bytes,
+    t.tx_hash,
+    t.day,
+    ROW_NUMBER() OVER (
+      PARTITION BY l1.seed_addr, t.day, t.from_address, t.to_address
+      ORDER BY t.value_wei_raw DESC, t.block_number DESC, t.tx_hash
+    ) AS rn
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN `driven-airway-469812-v8.GNN2.S2_l1_top15` l1   -- L1 = 15
+    ON l1.day = t.day
+   AND t.from_address = l1.neighbor_addr
+  JOIN `driven-airway-469812-v8.GNN2.S3_l2_top5`  l2   -- L2 = 5
+    ON l2.day = t.day
+   AND l2.seed_addr = l1.seed_addr
+   AND l2.neighbor2_addr = t.to_address
+  WHERE t.value_wei_raw >= 1e14   -- анти-пыль на E2
+)
+WHERE rn <= 20    -- кап 20 tx/день на пару (seed, day, L1→L2)
+
+UNION ALL
+
+-- ---------------- E2 (ветка B): to = L1, from = выбранный L2 ----------------
+SELECT * EXCEPT(rn) FROM (
+  SELECT
+    t.from_address,
+    t.to_address,
+    t.block_number,
+    t.ts                AS timestamp,
+    t.value_wei_raw,
+    t.gas_price_wei,
+    t.gas_used,
+    t.nonce,
+    t.input             AS input_bytes,
+    t.tx_hash,
+    t.day,
+    ROW_NUMBER() OVER (
+      PARTITION BY l1.seed_addr, t.day, t.to_address, t.from_address
+      ORDER BY t.value_wei_raw DESC, t.block_number DESC, t.tx_hash
+    ) AS rn
+  FROM `driven-airway-469812-v8.GNN2.S3_tx_by_day` t
+  JOIN `driven-airway-469812-v8.GNN2.S2_l1_top15` l1   -- L1 = 15
+    ON l1.day = t.day
+   AND t.to_address = l1.neighbor_addr
+  JOIN `driven-airway-469812-v8.GNN2.S3_l2_top5`  l2   -- L2 = 5
+    ON l2.day = t.day
+   AND l2.seed_addr = l1.seed_addr
+   AND l2.neighbor2_addr = t.from_address
+  WHERE t.value_wei_raw >= 1e14   -- анти-пыль на E2
+)
+WHERE rn <= 20    -- кап 20 tx/день на пару (seed, day, L2→L1)
+;
+
+
+-- S7: дедуп + признаки рёбер
+CREATE OR REPLACE TABLE `driven-airway-469812-v8.GNN2.S7_daily_edges_dedup`
+PARTITION BY day
+CLUSTER BY from_address, to_address AS
+SELECT
+  ANY_VALUE(LOWER(from_address)) AS from_address,
+  ANY_VALUE(LOWER(to_address))   AS to_address,
+  ANY_VALUE(block_number)        AS block_number,
+  ANY_VALUE(timestamp)           AS timestamp,
+  CAST(ANY_VALUE(value_wei_raw) AS NUMERIC) AS value_wei,  -- Wei (NUMERIC)
+  CAST(SAFE_MULTIPLY(ANY_VALUE(gas_price_wei), ANY_VALUE(gas_used)) AS NUMERIC) AS tx_fee_wei,
+  ANY_VALUE(nonce)               AS nonce,
+  -- длина input в байтах: (длина строки без "0x")/2
+  CAST(DIV(GREATEST(LENGTH(ANY_VALUE(input_bytes)) - 2, 0), 2) AS INT64) AS input_data_size,
+  (ANY_VALUE(to_address) IS NULL) AS contract_creation,
+  tx_hash,
+  day
+FROM `driven-airway-469812-v8.GNN2.S6_final_tx_daily`
+GROUP BY tx_hash, day;
+
+-- S8.A: создаём финальную таблицу один раз (если ещё нет)
+CREATE TABLE IF NOT EXISTS `driven-airway-469812-v8.GNN2.transactions_daily` (
+  from_address      STRING,
+  to_address        STRING,
+  block_number      INT64,
+  timestamp         TIMESTAMP,
+  value_wei         NUMERIC,
+  tx_fee_wei        NUMERIC,
+  nonce             INT64,
+  input_data_size   INT64,
+  contract_creation BOOL,
+  tx_hash           STRING,
+  day               DATE
+)
+PARTITION BY day
+CLUSTER BY from_address, to_address;
+
+-- S8.B: заливаем данные из S7
+INSERT INTO `driven-airway-469812-v8.GNN2.transactions_daily` (
+  from_address, to_address, block_number, timestamp,
+  value_wei, tx_fee_wei, nonce, input_data_size, contract_creation,
+  tx_hash, day
+)
+SELECT
+  from_address, to_address, block_number, timestamp,
+  value_wei, tx_fee_wei, nonce, input_data_size, contract_creation,
+  tx_hash, day
+FROM `driven-airway-469812-v8.GNN2.S7_daily_edges_dedup`;
+

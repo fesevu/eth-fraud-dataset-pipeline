@@ -1,0 +1,80 @@
+-- Таблица из CSV: columns = address,is_scam,description
+-- Загружаем базовую таблицу с адресами и метками (скам / не скам).
+-- Приводим адреса к нижнему регистру, чтобы унифицировать,
+-- и явно преобразуем is_scam к INT64.
+WITH addrs AS (
+  SELECT DISTINCT
+    LOWER(address)   AS address,
+    CAST(is_scam AS INT64) AS is_scam,
+    description
+  FROM `kinetic-physics-469205-b2.merged_accounts_base.base0`
+),
+
+-- Активность в обычных транзакциях
+-- Для каждого адреса из addrs смотрим его участие в обычных ETH-транзакциях:
+--  - как отправитель (from_address)
+--  - как получатель (to_address).
+-- Сохраняем время первой и последней транзакции.
+tx_activity AS (
+  SELECT
+    a.address,
+    MIN(t.block_timestamp) AS first_ts,
+    MAX(t.block_timestamp) AS last_ts
+  FROM addrs a
+  JOIN `bigquery-public-data.crypto_ethereum.transactions` t
+    ON LOWER(t.from_address) = a.address
+    OR LOWER(t.to_address)   = a.address
+  GROUP BY a.address
+),
+
+-- Активность в ERC20 transfer
+-- То же самое, но для токен-трансферов (ERC20, ERC721, ERC1155):
+--  - адрес как отправитель
+--  - адрес как получатель.
+-- Сохраняем время первой и последней активности.
+erc20_activity AS (
+  SELECT
+    a.address,
+    MIN(tt.block_timestamp) AS first_ts,
+    MAX(tt.block_timestamp) AS last_ts
+  FROM addrs a
+  JOIN `bigquery-public-data.crypto_ethereum.token_transfers` tt
+    ON LOWER(tt.from_address) = a.address
+    OR LOWER(tt.to_address)   = a.address
+  GROUP BY a.address
+),
+
+-- Объединяем таймстемпы: минимум от первых, максимум от последних
+-- Берём обе таблицы активности (ETH-транзакции и ERC20-трансферы).
+-- Для каждого адреса считаем:
+--   - first_seen_ts = самое раннее упоминание в любой из таблиц
+--   - last_seen_ts  = самое позднее упоминание в любой из таблиц
+-- При отсутствии данных (например, адрес был только в токенах или только в tx)
+-- подтягивается NULL, который отбрасывается.
+combined AS (
+  SELECT
+    a.address,
+    a.is_scam,
+    a.description,
+    (SELECT MIN(ts) FROM UNNEST([tx.first_ts, erc20.first_ts]) ts WHERE ts IS NOT NULL) AS first_seen_ts,
+    (SELECT MAX(ts) FROM UNNEST([tx.last_ts,  erc20.last_ts ]) ts WHERE ts IS NOT NULL) AS last_seen_ts
+  FROM addrs a
+  LEFT JOIN tx_activity    tx    USING (address)
+  LEFT JOIN erc20_activity erc20 USING (address)
+)
+
+-- Финальный результат:
+-- Для каждого адреса выводим:
+--  - сам адрес
+--  - метку is_scam
+--  - описание
+--  - время первой активности (в UNIX-формате, секунды UTC)
+--  - время последней активности (тоже UNIX).
+SELECT
+  c.address,
+  c.is_scam,
+  c.description,
+  IFNULL(UNIX_SECONDS(c.first_seen_ts), NULL) AS activity_start_ts,
+  IFNULL(UNIX_SECONDS(c.last_seen_ts),  NULL) AS activity_end_ts
+FROM combined c
+ORDER BY address;
