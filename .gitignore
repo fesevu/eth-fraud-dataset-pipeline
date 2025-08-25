@@ -11,6 +11,8 @@
 !/dataset/**/*.md
 !/dataset/**/*.py
 !/dataset/**/*.ipynb
+!/dataset/**/*.sh
+
 
 # --- Явно игнорим крупные форматы ---
 /dataset/**/*.csv
